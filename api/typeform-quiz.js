@@ -4,6 +4,12 @@ export default async function handler(req, res) {
   }
 
   const KLAVIYO_API_KEY = process.env.KLAVIYO_API_KEY;
+  // Debug: maskerad nyckelkontroll (syns i Vercel Logs)
+console.log(
+  "Key check:", (process.env.KLAVIYO_API_KEY || "").length, "chars; last4:",
+  (process.env.KLAVIYO_API_KEY || "").slice(-4)
+);
+
   const TYPEFORM_SECRET = process.env.TYPEFORM_SECRET;
   const KLAVIYO_METRIC = process.env.KLAVIYO_METRIC || "Fager Bit Quiz Completed";
 
