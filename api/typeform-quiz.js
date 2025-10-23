@@ -35,83 +35,47 @@ export default async function handler(req, res) {
     return res.status(500).json({ error: "Missing KLAVIYO_API_KEY" });
   }
 
-  // --- Headers helper (Klaviyo v2024)
   const headers = () => {
     const h = new Headers();
     h.set("Content-Type", "application/json");
     h.set("Accept", "application/json");
     h.set("Authorization", `Klaviyo-API-Key ${KLAVIYO_API_KEY}`);
-    // Nyare revision – kräver metric-id i relationship
+    // Håll oss kvar på nyare schema där metric-id krävs i relationship:
     h.set("revision", "2024-10-15");
     return h;
   };
 
-  // --- Ensure we have a Metric ID (create or find)
-  async function ensureMetricIdByName(name) {
-    // 1) Try create
-    try {
-      const createBody = {
-        data: { type: "metric", attributes: { name } },
-      };
-      const r = await fetchJson("https://a.klaviyo.com/api/metrics/", {
-        method: "POST",
-        headers: headers(),
-        body: JSON.stringify(createBody),
-        timeoutMs: 8000,
-      });
-      if (r.ok && r.json?.data?.id) {
-        console.log("Metric created:", r.json.data.id);
-        return r.json.data.id;
-      }
-      // If create failed, we’ll fall back to search
-      console.warn("Create metric failed:", r.status, r.text?.slice(0, 400));
-    } catch (e) {
-      console.warn("Create metric error:", e?.message || e);
-    }
-
-    // 2) List+paging until we find matching name
-    let cursor = null;
-    for (let page = 0; page < 20; page++) { // safety cap
-      const url =
-        "https://a.klaviyo.com/api/metrics/?" +
-        new URLSearchParams({
-          "page[size]": "100",
-          ...(cursor ? { "page[cursor]": cursor } : {}),
-        }).toString();
-
+  // --- Hämta metric-ID genom att lista alla metrics och följa links.next
+  async function findMetricIdByName(name) {
+    let url = "https://a.klaviyo.com/api/metrics/"; // inga query params
+    for (let page = 0; page < 50; page++) {         // säkerhetsbegränsning
       const r = await fetchJson(url, {
         method: "GET",
         headers: headers(),
         timeoutMs: 8000,
       });
-
       if (!r.ok) {
         console.warn("List metrics failed:", r.status, r.text?.slice(0, 400));
-        break;
+        return null;
       }
-
       const arr = r.json?.data || [];
       const hit = arr.find(
         (m) =>
           m?.attributes?.name?.toLowerCase().trim() === name.toLowerCase().trim()
       );
-      if (hit?.id) {
-        console.log("Metric found:", hit.id);
-        return hit.id;
-      }
+      if (hit?.id) return hit.id;
 
-      cursor = r.json?.links?.next ?? null;
-      if (!cursor) break;
+      const nextLink = r.json?.links?.next;
+      if (!nextLink) break;
+      url = nextLink; // följ serverns cursor-länk
     }
-
-    return null; // not found
+    return null;
   }
 
   try {
     const rawBody = typeof req.body === "string" ? JSON.parse(req.body) : req.body;
     const fr = rawBody?.form_response || {};
 
-    // Optional Typeform secret check
     if (TYPEFORM_SECRET) {
       const sentSecret =
         rawBody?.secret ||
@@ -123,7 +87,6 @@ export default async function handler(req, res) {
       }
     }
 
-    // Extract email
     const email =
       (fr.answers || []).find((a) => a?.type === "email" && a?.email)?.email ||
       fr.hidden?.email ||
@@ -133,24 +96,23 @@ export default async function handler(req, res) {
       return res.status(200).json({ ok: true, note: "No email; skipping." });
     }
 
-    // Quiz properties
     const ending =
       fr?.calculated?.outcome?.title || fr?.hidden?.ending || "unknown";
     const quizName = fr?.hidden?.quiz_name || "FagerBitQuiz";
     const source = fr?.hidden?.source || "Website";
     const submittedAt = fr?.submitted_at || new Date().toISOString();
 
-    // --- Get/ensure metric id
-    const metricId = await ensureMetricIdByName(KLAVIYO_METRIC);
+    // Hitta metricens ID (vi får inte skapa – bara läsa)
+    const metricId = await findMetricIdByName(KLAVIYO_METRIC);
     if (!metricId) {
       console.error("Could not resolve metric id for", KLAVIYO_METRIC);
-      // Svara 200 så TF inte spammar (men lämna loggarna!)
+      // Svara 200 så TF inte spammar (men vi ser felet i loggarna)
       return res
         .status(200)
         .json({ ok: false, note: "Could not resolve Klaviyo metric id" });
     }
 
-    // --- Build event payload with RELATIONSHIP metric.id
+    // Bygg event – relationships.metric.data.id måste sättas
     const eventBody = {
       data: {
         type: "event",
@@ -166,31 +128,26 @@ export default async function handler(req, res) {
         },
         relationships: {
           metric: {
-            data: {
-              type: "metric",
-              id: metricId,
-            },
+            data: { type: "metric", id: metricId },
           },
         },
       },
     };
 
-    // --- POST event
     console.log("Posting to Klaviyo…");
-    const r = await fetchJson("https://a.klaviyo.com/api/events/", {
+    const post = await fetchJson("https://a.klaviyo.com/api/events/", {
       method: "POST",
       headers: headers(),
       body: JSON.stringify(eventBody),
       timeoutMs: 8000,
     });
 
-    if (!r.ok) {
-      console.error("Klaviyo error:", r.status, r.text?.slice(0, 800));
+    if (!post.ok) {
+      console.error("Klaviyo error:", post.status, post.text?.slice(0, 800));
     } else {
       console.log("Klaviyo OK for", email, ending);
     }
 
-    // Svara alltid 200 till Typeform för att undvika retry-storm
     return res.status(200).json({ ok: true });
   } catch (err) {
     console.error("Handler error:", err);
