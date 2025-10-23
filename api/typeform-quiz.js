@@ -102,20 +102,28 @@ console.log(
           },
         };
 
-        const resp = await postToKlaviyo(
-          "https://a.klaviyo.com/api/events/",
-          {
-            method: "POST",
-            headers: {
-              "Content-Type": "application/json",
-              Accept: "application/json",
-              Authorization: `Klaviyo-API-Key ${KLAVIYO_API_KEY}`,
-              revision: "2023-07-15",
-            },
-            body: JSON.stringify(eventBody),
-          },
-          { retries: 2, timeoutMs: 10000 }
-        );
+    const controller = new AbortController();
+const timeout = setTimeout(() => controller.abort(), 15000); // 15 sek timeout istället för 10
+
+let resp;
+try {
+  resp = await fetch("https://a.klaviyo.com/api/events/", {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      Accept: "application/json",
+      Authorization: `Klaviyo-API-Key ${KLAVIYO_API_KEY}`,
+      revision: "2023-02-22",
+    },
+    body: JSON.stringify(eventBody),
+    signal: controller.signal,
+  });
+} catch (err) {
+  console.error("Klaviyo fetch error:", err.message);
+  throw err;
+} finally {
+  clearTimeout(timeout);
+}
 
         if (resp?.ok) {
           console.log("Klaviyo OK for", email, ending);
