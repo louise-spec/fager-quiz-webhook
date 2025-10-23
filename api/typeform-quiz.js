@@ -6,11 +6,10 @@ export default async function handler(req, res) {
   }
 
   const KLAVIYO_API_KEY = process.env.KLAVIYO_API_KEY;
-  const METRIC_ID_ENV = process.env.KLAVIYO_METRIC_ID || "";
-  const METRIC_NAME = process.env.KLAVIYO_METRIC || "Filled Out Form";
-  const TYPEFORM_SECRET = process.env.TYPEFORM_SECRET || "";
+  const KLAVIYO_METRIC = process.env.KLAVIYO_METRIC || "Filled Out Form"; // <-- namn, inte ID
+  const TYPEFORM_SECRET = process.env.TYPEFORM_SECRET;
 
-  // Hjälpsam maskerad logg
+  // Hjälpsam logg för att se att nyckeln finns (maskerad)
   console.log(
     "Key check:",
     (KLAVIYO_API_KEY || "").length,
@@ -20,26 +19,23 @@ export default async function handler(req, res) {
 
   if (!KLAVIYO_API_KEY) {
     console.error("Missing KLAVIYO_API_KEY");
-    return res.status(200).json({ ok: true, note: "Missing API key" });
+    return res.status(500).json({ error: "Server not configured" });
   }
 
   try {
     const body = typeof req.body === "string" ? JSON.parse(req.body) : req.body;
     const fr = body?.form_response || {};
 
-    // (Valfritt) enkel secret-validering om du satt secret i Typeform
+    // (Valfritt) enkel secret-kontroll om du satte en Secret i Typeform
     if (TYPEFORM_SECRET) {
-      const sentSecret =
-        body?.secret ||
-        body?.form_response?.hidden?.secret ||
-        body?.form_response?.hidden?.Secret;
-      if (sentSecret && sentSecret !== TYPEFORM_SECRET) {
+      const sent = body?.secret || fr?.hidden?.secret;
+      if (sent && sent !== TYPEFORM_SECRET) {
         console.warn("Typeform secret mismatch – ignoring");
         return res.status(200).json({ ok: true, note: "Secret mismatch" });
       }
     }
 
-    // 1) Plocka e-post
+    // Plocka e-post
     const email =
       (fr.answers || []).find((a) => a?.type === "email" && a?.email)?.email ||
       fr.hidden?.email ||
@@ -47,69 +43,41 @@ export default async function handler(req, res) {
 
     if (!email) {
       console.warn("No email in submission; skipping Klaviyo send.");
-      return res
-        .status(200)
-        .json({ ok: true, note: "No email in submission; skipping." });
+      return res.status(200).json({ ok: true, note: "No email; skipping." });
     }
 
-    // 2) Övriga properties vi vill spara på eventet
-    const ending =
-      fr?.calculated?.outcome?.title || fr?.hidden?.ending || "unknown";
+    // Quizdata
+    const ending = fr?.calculated?.outcome?.title || fr?.hidden?.ending || "unknown";
     const quizName = fr?.hidden?.quiz_name || "FagerBitQuiz";
     const source = fr?.hidden?.source || "Website";
-    const submittedAt = fr?.submitted_at || new Date().toISOString();
+    const submittedAt =
+      fr?.submitted_at ||
+      new Date().toISOString(); // ISO 8601 (UTC), ok för Klaviyo
 
-    // 3) Hitta metric-ID (använd env om satt; annars lista metrics och leta namn)
-    let metricId = METRIC_ID_ENV;
-    if (!metricId) {
-      try {
-        metricId = await resolveMetricIdByName({
-          name: METRIC_NAME,
-          apiKey: KLAVIYO_API_KEY,
-        });
-      } catch (e) {
-        console.warn("Failed to resolve metric id by name:", e?.message || e);
-      }
-    }
-    if (!metricId) {
-      console.error(
-        `Could not resolve metric id for ${METRIC_NAME}. Set KLAVIYO_METRIC_ID env to avoid lookup.`
-      );
-      return res.status(200).json({
-        ok: true,
-        note: `Could not resolve metric id for ${METRIC_NAME}`,
-      });
-    }
-
-    // 4) Bygg event enligt JSON:API (2023-07-15)
+    // Rätt format för Klaviyo Events: metric via attributes.metric (namn), INTE relationships
     const eventBody = {
       data: {
         type: "event",
         attributes: {
-          // "time" eller "occurred_at" – Klaviyo accepterar "time"
-          time: submittedAt,
+          metric: { name: KLAVIYO_METRIC }, // <-- viktigt
+          profile: { email },
           properties: {
             quiz_name: quizName,
             quiz_result: ending,
             source,
             submitted_at: submittedAt,
           },
-        },
-        relationships: {
-          metric: {
-            data: { type: "metric", id: metricId },
-          },
-          profile: {
-            // Använd Klaviyos special-ID för e-post
-            data: { type: "profile", id: `$email:${email}` },
-          },
+          occurred_at: submittedAt,
         },
       },
     };
 
-    // 5) POST event
+    // Skicka till Klaviyo
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 8000);
+
     try {
-      console.log("Posting to Klaviyo… metricId:", metricId);
+      console.log("Posting to Klaviyo…");
       const resp = await fetch("https://a.klaviyo.com/api/events/", {
         method: "POST",
         headers: {
@@ -119,56 +87,25 @@ export default async function handler(req, res) {
           revision: "2023-07-15",
         },
         body: JSON.stringify(eventBody),
+        signal: controller.signal,
       });
+      clearTimeout(timeout);
 
       if (!resp.ok) {
         const txt = await resp.text().catch(() => "");
-        console.error("Klaviyo error:", resp.status, txt?.slice(0, 400));
+        console.error("Klaviyo error:", resp.status, txt?.slice(0, 500));
       } else {
         console.log("Klaviyo OK for", email, ending);
       }
     } catch (err) {
+      clearTimeout(timeout);
       console.error("Klaviyo fetch error:", err?.message || err);
     }
 
-    // Svara 200 till Typeform oavsett
+    // Alltid 200 till Typeform (så de inte retry:ar)
     return res.status(200).json({ ok: true });
   } catch (err) {
     console.error("Handler error:", err);
-    return res.status(200).json({ ok: true, note: "handler error" });
+    return res.status(500).json({ error: "Internal server error" });
   }
-}
-
-/**
- * Hitta metric-ID via namn, med pagination (page[size], links.next]).
- * Returnerar tom sträng om inte hittad.
- */
-async function resolveMetricIdByName({ name, apiKey }) {
-  let url = "https://a.klaviyo.com/api/metrics/?page[size]=100";
-
-  for (let i = 0; i < 20 && url; i++) {
-    const r = await fetch(url, {
-      headers: {
-        Accept: "application/json",
-        Authorization: `Klaviyo-API-Key ${apiKey}`,
-        revision: "2023-07-15",
-      },
-    });
-
-    if (!r.ok) {
-      const t = await r.text().catch(() => "");
-      console.warn("List metrics failed:", r.status, t?.slice(0, 400));
-      return "";
-    }
-
-    const json = await r.json();
-    const found = (json?.data || []).find(
-      (m) => m?.attributes?.name?.trim() === name
-    );
-    if (found?.id) return found.id;
-
-    url = json?.links?.next || "";
-  }
-
-  return "";
 }
