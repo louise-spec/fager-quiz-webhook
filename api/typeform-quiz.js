@@ -86,7 +86,6 @@ export default async function handler(req, res) {
           "Content-Type": "application/json",
           Accept: "application/json",
           Authorization: `Klaviyo-API-Key ${KLAVIYO_API_KEY}`,
-          revision: "2023-07-15",
         },
         body: JSON.stringify(eventBody),
         signal: controller.signal,
