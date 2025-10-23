@@ -5,12 +5,13 @@ export default async function handler(req, res) {
     return res.status(405).json({ error: "Method not allowed" });
   }
 
+  // ---- Env
   const KLAVIYO_API_KEY = process.env.KLAVIYO_API_KEY;
   const KLAVIYO_METRIC =
     process.env.KLAVIYO_METRIC || "Fager Bit Quiz Completed";
   const TYPEFORM_SECRET = process.env.TYPEFORM_SECRET; // valfri validering
 
-  // Hjälpsam debugrad i Vercel Logs (maskerad)
+  // Hjälpsam debug i Vercel Logs (maskerad)
   console.log(
     "Key check:",
     (KLAVIYO_API_KEY || "").length,
@@ -28,9 +29,10 @@ export default async function handler(req, res) {
     const body = typeof req.body === "string" ? JSON.parse(req.body) : req.body;
     const fr = body?.form_response || {};
 
-    // (Valfritt) enkel secret-kontroll om du satte en “Secret” i Typeform
+    // (Valfritt) enkel secret-kontroll om du satte en Secret i Typeform/Webhook
     if (TYPEFORM_SECRET) {
-      const sentSecret = body?.secret || body?.form_response?.hidden?.secret;
+      const sentSecret =
+        body?.secret || body?.form_response?.hidden?.secret || body?.hidden?.secret;
       if (sentSecret && sentSecret !== TYPEFORM_SECRET) {
         console.warn("Typeform secret mismatch – ignoring");
         return res.status(200).json({ ok: true, note: "Secret mismatch" });
@@ -52,12 +54,13 @@ export default async function handler(req, res) {
     }
 
     // Quizdata
-    const ending = fr?.calculated?.outcome?.title || fr?.hidden?.ending || "unknown";
+    const ending =
+      fr?.calculated?.outcome?.title || fr?.hidden?.ending || "unknown";
     const quizName = fr?.hidden?.quiz_name || "FagerBitQuiz";
     const source = fr?.hidden?.source || "Website";
     const submittedAt = fr?.submitted_at || new Date().toISOString();
 
-    // Bygg eventet – detta skapar metricen automatiskt i Klaviyo om den inte finns
+    // Bygg eventet – Klaviyo skapar metricen automatiskt om den saknas
     const eventBody = {
       data: {
         type: "event",
@@ -75,26 +78,31 @@ export default async function handler(req, res) {
       },
     };
 
-    // Posta direkt till Klaviyo (kort timeout + ett enda försök)
+    // --- Skicka till Klaviyo med korrekt headers (inkl. revision)
     const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), 7000); // 7s
+    const timeout = setTimeout(() => controller.abort(), 7000); // 7s timeout
+
     try {
       console.log("Posting to Klaviyo…");
+
+      const headers = new Headers();
+      headers.set("Content-Type", "application/json");
+      headers.set("Accept", "application/json");
+      headers.set("Authorization", `Klaviyo-API-Key ${KLAVIYO_API_KEY}`);
+      headers.set("revision", "2024-10-15"); // VIKTIGT: YYYY-MM-DD
+
       const resp = await fetch("https://a.klaviyo.com/api/events/", {
         method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          Accept: "application/json",
-          Authorization: `Klaviyo-API-Key ${KLAVIYO_API_KEY}`,
-        },
+        headers,
         body: JSON.stringify(eventBody),
         signal: controller.signal,
       });
+
       clearTimeout(timeout);
 
       if (!resp.ok) {
         const txt = await resp.text().catch(() => "");
-        console.error("Klaviyo error:", resp.status, txt?.slice(0, 300));
+        console.error("Klaviyo error:", resp.status, txt?.slice(0, 500));
       } else {
         console.log("Klaviyo OK for", email, ending);
       }
