@@ -21,7 +21,7 @@ export default async function handler(req, res) {
 
   const KLAVIYO_API_KEY = process.env.KLAVIYO_API_KEY;
   const KLAVIYO_METRIC =
-    process.env.KLAVIYO_METRIC || "Fager Bit Quiz Completed";
+    process.env.KLAVIYO_METRIC || "Filled Out Form";
   const TYPEFORM_SECRET = process.env.TYPEFORM_SECRET;
 
   console.log(
