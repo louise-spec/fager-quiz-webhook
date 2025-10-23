@@ -1,7 +1,7 @@
 {
   "functions": {
-    "api/typeform-quiz.js": {
-      "regions": ["dub1", "iad1", "sfo1"]
+    "api/**/*.js": {
+      "regions": ["iad1", "dub1", "sfo1"]
     }
   }
 }
