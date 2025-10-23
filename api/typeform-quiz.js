@@ -1,22 +1,24 @@
 // api/typeform-quiz.js
-// Endpoint som mappar endings → ending_key och skickar Klaviyo-event
+// Version för Fager Quiz → Klaviyo metric ID: VqXtMg
+// Robust mot nya endings (slugify-fallback + logging)
 
 export default async function handler(req, res) {
   if (req.method !== "POST") {
     return res.status(405).json({ error: "Method not allowed" });
   }
 
+  // === Environment variables ===
   const KLAVIYO_API_KEY = process.env.KLAVIYO_API_KEY;
+  const KLAVIYO_METRIC_ID = process.env.KLAVIYO_METRIC_ID || "VqXtMg"; // ert metric-ID
   const TYPEFORM_SECRET = process.env.TYPEFORM_SECRET || "";
+
   if (!KLAVIYO_API_KEY) {
-    console.error("Missing KLAVIYO_API_KEY");
+    console.error("❌ Missing KLAVIYO_API_KEY");
     return res.status(500).json({ error: "Server not configured" });
   }
 
-  // 1) Synonym-karta för endings → ending_key
-  //    Lägg till alla dina kända endings här (vänster sida kan vara olika stavningar)
+  // === Known endings (lägg till de ni vill ha egna flöden för) ===
   const ENDING_LOOKUP = {
-    // Exempel
     "john linus": "john_linus",
     "johnlinus": "john_linus",
     "john-linus": "john_linus",
@@ -24,10 +26,9 @@ export default async function handler(req, res) {
     "bett-a": "bett_a",
     "bett b": "bett_b",
     "bett-b": "bett_b",
-    // ... fyll på alla era varianter här
   };
 
-  // 2) slugifier – fallback för okända endings → gör en stabil key
+  // === Helper: slugify for unknown endings ===
   const slugify = (s) =>
     String(s || "")
       .normalize("NFKD")
@@ -38,110 +39,115 @@ export default async function handler(req, res) {
       .replace(/^_+|_+$/g, "")
       .slice(0, 60) || "unknown";
 
-  // 3) normalisera ending via lookup + slugify
+  // === Map ending to key ===
   const toEndingKey = (title) => {
     const raw = String(title || "").trim();
     if (!raw) return "unknown";
-    const compact = raw.toLowerCase().replace(/\s+/g, " ").replace(/-/g, "-");
-    if (ENDING_LOOKUP[compact]) return ENDING_LOOKUP[compact];
-    // pröva utan mellanslag/streck
-    const simplified = compact.replace(/[\s-]+/g, "");
-    if (ENDING_LOOKUP[simplified]) return ENDING_LOOKUP[simplified];
-    return slugify(raw);
+    const lower = raw.toLowerCase();
+    return (
+      ENDING_LOOKUP[lower] ||
+      ENDING_LOOKUP[lower.replace(/[\s-]+/g, "")] ||
+      slugify(raw)
+    );
   };
+
+  // === Set to avoid duplicate "unknown ending" logs ===
+  const SEEN_UNKNOWN = new Set();
 
   try {
     const body = typeof req.body === "string" ? JSON.parse(req.body) : req.body;
     const fr = body?.form_response || {};
 
-    // (valfritt) enkel secret-check
+    // === (Optional) Typeform secret validation ===
     if (TYPEFORM_SECRET) {
-      const sentSecret = body?.secret || fr?.hidden?.secret || body?.form_response?.hidden?.secret;
+      const sentSecret = body?.secret || fr?.hidden?.secret;
       if (sentSecret && sentSecret !== TYPEFORM_SECRET) {
-        console.warn("Typeform secret mismatch – ignoring");
+        console.warn("⚠️ Typeform secret mismatch – ignoring");
         return res.status(200).json({ ok: true, note: "Secret mismatch" });
       }
     }
 
-    // Email
+    // === Extract email ===
     const email =
       (fr.answers || []).find((a) => a?.type === "email" && a?.email)?.email ||
       fr.hidden?.email ||
       null;
+
     if (!email) {
-      console.warn("No email in submission; skipping Klaviyo send.", {
-        form_id: fr?.form_id,
-        token: fr?.token,
-      });
+      console.warn("⚠️ No email in submission; skipping Klaviyo send.");
       return res.status(200).json({ ok: true, note: "No email; skipping." });
     }
 
-    // Läs ending från calculated outcome → annars hidden.ending
+    // === Extract ending info ===
     const endingTitle =
-      fr?.calculated?.outcome?.title ||
-      fr?.hidden?.ending ||
-      "Unknown";
-
+      fr?.calculated?.outcome?.title || fr?.hidden?.ending || "Unknown";
     const ending_key = toEndingKey(endingTitle);
+
+    // Log new / unmapped endings once
+    if (
+      !Object.values(ENDING_LOOKUP).includes(ending_key) &&
+      !ENDING_LOOKUP[endingTitle.toLowerCase()]
+    ) {
+      const k = `${endingTitle} -> ${ending_key}`;
+      if (!SEEN_UNKNOWN.has(k)) {
+        SEEN_UNKNOWN.add(k);
+        console.warn("💡 Ny/omappad ending upptäckt:", k);
+        console.warn(`  Lägg till i ENDING_LOOKUP vid behov:`);
+        console.warn(`  "${endingTitle.toLowerCase()}": "${ending_key}",`);
+        console.warn(`  "${endingTitle.toLowerCase().replace(/[\s-]+/g, "")}": "${ending_key}",`);
+      }
+    }
+
+    // === Hidden fields ===
     const quiz_name = fr?.hidden?.quiz_name || "FagerBitQuiz";
     const source = fr?.hidden?.source || "Website";
     const submittedAt = fr?.submitted_at || new Date().toISOString();
 
-    // Klaviyo Events API (nya JSON:API – OBS: metric/profile i attributes)
+    // === Build event for Klaviyo ===
     const eventBody = {
       data: {
         type: "event",
         attributes: {
-          metric: { name: "Fager Quiz Completed" }, // byt om du vill
-          profile: { email },
           properties: {
             quiz_name,
-            ending_key,           // ← använd denna för flödeslogiken
+            ending_key, // används i Klaviyo-flöden
             ending_title: endingTitle,
             source,
             submitted_at: submittedAt,
             typeform_form_id: fr?.form_id,
             typeform_response_id: fr?.token,
           },
-          time: submittedAt,
+          occurred_at: submittedAt,
+        },
+        relationships: {
+          metric: { data: { type: "metric", id: KLAVIYO_METRIC_ID } },
+          profile: { data: { type: "profile", id: `$email:${email}` } },
         },
       },
     };
 
-    // Skicka
-    const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), 10000);
+    // === Send to Klaviyo ===
+    const resp = await fetch("https://a.klaviyo.com/api/events/", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Accept: "application/json",
+        Authorization: `Klaviyo-API-Key ${KLAVIYO_API_KEY}`,
+        revision: "2024-10-15", // krävs för relationship-schemat
+      },
+      body: JSON.stringify(eventBody),
+    });
 
-    try {
-      const resp = await fetch("https://a.klaviyo.com/api/events/", {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          Accept: "application/json",
-          Authorization: `Klaviyo-API-Key ${KLAVIYO_API_KEY}`,
-          revision: "2024-06-15", // giltigt datumformat
-        },
-        body: JSON.stringify(eventBody),
-        signal: controller.signal,
-      });
-      clearTimeout(timeout);
-
-      if (!resp.ok) {
-        const txt = await resp.text().catch(() => "");
-        console.error("Klaviyo error:", resp.status, txt?.slice(0, 1200));
-        return res.status(502).json({ ok: false, status: resp.status, error: txt });
-      }
-
-      const data = await resp.json().catch(() => ({}));
-      console.log("✅ Klaviyo OK", { email, ending_key, endingTitle });
-      return res.status(200).json({ ok: true, klaviyo: data });
-    } catch (err) {
-      clearTimeout(timeout);
-      console.error("Klaviyo fetch error:", err?.message || err);
-      return res.status(502).json({ ok: false, error: String(err?.message || err) });
+    if (!resp.ok) {
+      const txt = await resp.text().catch(() => "");
+      console.error("❌ Klaviyo error:", resp.status, txt?.slice(0, 1000));
+      return res.status(502).json({ ok: false, status: resp.status, error: txt });
     }
+
+    console.log("✅ Klaviyo OK", { email, ending_key, metric: KLAVIYO_METRIC_ID });
+    return res.status(200).json({ ok: true });
   } catch (err) {
-    console.error("Handler error:", err);
+    console.error("💥 Handler error:", err);
     return res.status(500).json({ error: "Internal server error" });
   }
 }
