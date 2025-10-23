@@ -4,12 +4,12 @@ export default async function handler(req, res) {
     return res.status(405).json({ error: "Method not allowed" });
   }
 
-  // --- Env
+  // === Env
   const KLAVIYO_API_KEY = process.env.KLAVIYO_API_KEY;
-  const TYPEFORM_SECRET = process.env.TYPEFORM_SECRET; // (valfri, ej strikt verifiering här)
+  const TYPEFORM_SECRET = process.env.TYPEFORM_SECRET; // valfritt – ej strikt verifiering här
   const KLAVIYO_METRIC = process.env.KLAVIYO_METRIC || "Fager Bit Quiz Completed";
 
-  // (valfri debug – kan tas bort när allt rullar)
+  // Valfri debug, bra vid felsökning (syns i Vercel Logs)
   console.log(
     "Key check:",
     (KLAVIYO_API_KEY || "").length,
@@ -18,11 +18,11 @@ export default async function handler(req, res) {
   );
 
   try {
-    // --- Body
+    // === Body från Typeform
     const body = typeof req.body === "string" ? JSON.parse(req.body) : req.body;
     const fr = body?.form_response || {};
 
-    // --- Email
+    // === E-post (från Email-fråga eller hidden.email)
     const email =
       (fr.answers || []).find((a) => a?.type === "email")?.email ||
       fr.hidden?.email ||
@@ -33,7 +33,7 @@ export default async function handler(req, res) {
       return res.status(200).json({ ok: true, note: "No email in submission; skipping." });
     }
 
-    // --- Quiz-data
+    // === Quiz-properties
     const ending =
       fr?.calculated?.outcome?.title ||
       fr?.hidden?.ending ||
@@ -43,14 +43,14 @@ export default async function handler(req, res) {
     const source = fr?.hidden?.source || "Website";
     const submittedAt = fr?.submitted_at || new Date().toISOString();
 
-    // --- Svara Typeform direkt (slipp väntetid/timeout där)
+    // Svara Typeform direkt (så de inte väntar på Klaviyo)
     res.status(200).json({ ok: true });
 
-    // --- Hjälpare: retry + timeout mot Klaviyo
+    // === Hjälpare: POST till Klaviyo med retry + timeout
     async function postToKlaviyoWithRetry(eventBody) {
       const url = "https://a.klaviyo.com/api/events/";
-      const maxRetries = 3;
-      const timeoutMs = 25000; // 25s
+      const maxRetries = 4;
+      const timeoutMs = 30000; // 30s
 
       for (let attempt = 1; attempt <= maxRetries; attempt++) {
         const controller = new AbortController();
@@ -76,20 +76,24 @@ export default async function handler(req, res) {
             return resp;
           } else {
             const text = await resp.text().catch(() => "");
-            console.warn(`Klaviyo responded ${resp.status} on attempt ${attempt}: ${text}`);
+            console.warn(
+              `Klaviyo responded ${resp.status} on attempt ${attempt}: ${text}`
+            );
           }
         } catch (err) {
           console.error(`Klaviyo fetch error attempt ${attempt}:`, err?.message || err);
           if (attempt === maxRetries) throw err;
-          // Exponential backoff: 2s, 4s
-          await new Promise((r) => setTimeout(r, 2000 * attempt));
+          // Exponential backoff: 2s, 4s, 8s, 8s (cap vid 8s)
+          await new Promise((r) =>
+            setTimeout(r, Math.min(8000, 2000 * 2 ** (attempt - 1)))
+          );
         } finally {
           clearTimeout(timeout);
         }
       }
     }
 
-    // --- Bygg event & skicka i bakgrunden
+    // === Bygg event + skicka i bakgrunden
     queueMicrotask(async () => {
       try {
         if (!KLAVIYO_API_KEY) throw new Error("Missing KLAVIYO_API_KEY");
