@@ -5,13 +5,12 @@ export default async function handler(req, res) {
     return res.status(405).json({ error: "Method not allowed" });
   }
 
-  // ---- Env
   const KLAVIYO_API_KEY = process.env.KLAVIYO_API_KEY;
   const KLAVIYO_METRIC =
     process.env.KLAVIYO_METRIC || "Fager Bit Quiz Completed";
-  const TYPEFORM_SECRET = process.env.TYPEFORM_SECRET; // valfri validering
+  const TYPEFORM_SECRET = process.env.TYPEFORM_SECRET; // valfri
 
-  // Hjälpsam debug i Vercel Logs (maskerad)
+  // Maskerad nyckel i logg för snabb felsökning
   console.log(
     "Key check:",
     (KLAVIYO_API_KEY || "").length,
@@ -25,11 +24,10 @@ export default async function handler(req, res) {
   }
 
   try {
-    // Typeform skickar JSON
     const body = typeof req.body === "string" ? JSON.parse(req.body) : req.body;
     const fr = body?.form_response || {};
 
-    // (Valfritt) enkel secret-kontroll om du satte en Secret i Typeform/Webhook
+    // (Valfritt) enkel secret-kontroll om du satt en secret i Typeform
     if (TYPEFORM_SECRET) {
       const sentSecret =
         body?.secret || body?.form_response?.hidden?.secret || body?.hidden?.secret;
@@ -39,7 +37,7 @@ export default async function handler(req, res) {
       }
     }
 
-    // Plocka e-post
+    // Hämta e-post
     const email =
       (fr.answers || []).find((a) => a?.type === "email" && a?.email)?.email ||
       fr.hidden?.email ||
@@ -47,25 +45,21 @@ export default async function handler(req, res) {
 
     if (!email) {
       console.warn("No email in submission; skipping Klaviyo send.");
-      // Svara 200 så Typeform inte spammar retries
-      return res
-        .status(200)
-        .json({ ok: true, note: "No email in submission; skipping." });
+      return res.status(200).json({ ok: true, note: "No email in submission; skipping." });
     }
 
-    // Quizdata
+    // Quiz-data
     const ending =
       fr?.calculated?.outcome?.title || fr?.hidden?.ending || "unknown";
     const quizName = fr?.hidden?.quiz_name || "FagerBitQuiz";
     const source = fr?.hidden?.source || "Website";
     const submittedAt = fr?.submitted_at || new Date().toISOString();
 
-    // Bygg eventet – Klaviyo skapar metricen automatiskt om den saknas
+    // Viktigt: metric i RELATIONSHIPS (inte i attributes)
     const eventBody = {
       data: {
         type: "event",
         attributes: {
-          metric: { name: KLAVIYO_METRIC },
           properties: {
             quiz_name: quizName,
             quiz_result: ending,
@@ -75,12 +69,25 @@ export default async function handler(req, res) {
           profile: { email },
           occurred_at: submittedAt,
         },
+        relationships: {
+          metric: {
+            // Antingen med attributes.name (skapar metric om den saknas)
+            data: {
+              type: "metric",
+              attributes: {
+                name: KLAVIYO_METRIC,
+              },
+            },
+            // OBS: om du i framtiden vill referera en befintlig metric med id istället:
+            // data: { type: "metric", id: "METRIC_ID" }
+          },
+        },
       },
     };
 
-    // --- Skicka till Klaviyo med korrekt headers (inkl. revision)
+    // Skicka till Klaviyo
     const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), 7000); // 7s timeout
+    const timeout = setTimeout(() => controller.abort(), 7000);
 
     try {
       console.log("Posting to Klaviyo…");
@@ -89,7 +96,7 @@ export default async function handler(req, res) {
       headers.set("Content-Type", "application/json");
       headers.set("Accept", "application/json");
       headers.set("Authorization", `Klaviyo-API-Key ${KLAVIYO_API_KEY}`);
-      headers.set("revision", "2024-10-15"); // VIKTIGT: YYYY-MM-DD
+      headers.set("revision", "2024-10-15"); // nyare schema
 
       const resp = await fetch("https://a.klaviyo.com/api/events/", {
         method: "POST",
@@ -102,7 +109,7 @@ export default async function handler(req, res) {
 
       if (!resp.ok) {
         const txt = await resp.text().catch(() => "");
-        console.error("Klaviyo error:", resp.status, txt?.slice(0, 500));
+        console.error("Klaviyo error:", resp.status, txt?.slice(0, 800));
       } else {
         console.log("Klaviyo OK for", email, ending);
       }
@@ -111,7 +118,6 @@ export default async function handler(req, res) {
       console.error("Klaviyo fetch error:", err?.message || err);
     }
 
-    // Svara alltid 200 till Typeform
     return res.status(200).json({ ok: true });
   } catch (err) {
     console.error("Handler error:", err);
