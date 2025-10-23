@@ -102,28 +102,50 @@ console.log(
           },
         };
 
-    const controller = new AbortController();
-const timeout = setTimeout(() => controller.abort(), 15000); // 15 sek timeout istället för 10
+ async function postToKlaviyoWithRetry(eventBody) {
+  const url = "https://a.klaviyo.com/api/events/";
+  const maxRetries = 3;
+  const timeoutMs = 25000; // 25 sekunder
 
-let resp;
-try {
-  resp = await fetch("https://a.klaviyo.com/api/events/", {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      Accept: "application/json",
-      Authorization: `Klaviyo-API-Key ${KLAVIYO_API_KEY}`,
-      revision: "2023-02-22",
-    },
-    body: JSON.stringify(eventBody),
-    signal: controller.signal,
-  });
-} catch (err) {
-  console.error("Klaviyo fetch error:", err.message);
-  throw err;
-} finally {
-  clearTimeout(timeout);
+  for (let attempt = 1; attempt <= maxRetries; attempt++) {
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), timeoutMs);
+
+    try {
+      const resp = await fetch(url, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Accept: "application/json",
+          Authorization: `Klaviyo-API-Key ${KLAVIYO_API_KEY}`,
+          revision: "2023-02-22",
+        },
+        body: JSON.stringify(eventBody),
+        signal: controller.signal,
+      });
+
+      clearTimeout(timeout);
+
+      if (resp.ok) {
+        console.log(`Klaviyo OK on attempt ${attempt}`);
+        return resp;
+      } else {
+        const text = await resp.text();
+        console.warn(`Klaviyo responded ${resp.status}: ${text}`);
+      }
+    } catch (err) {
+      console.error(`Klaviyo fetch error attempt ${attempt}:`, err.message);
+      if (attempt === maxRetries) throw err; // kasta efter sista försöket
+      await new Promise(r => setTimeout(r, 2000 * attempt)); // vänta lite längre mellan försöken
+    } finally {
+      clearTimeout(timeout);
+    }
+  }
 }
+
+// 🔽 Använd sedan denna rad istället för din gamla fetch:
+const resp = await postToKlaviyoWithRetry(eventBody);
+
 
         if (resp?.ok) {
           console.log("Klaviyo OK for", email, ending);
