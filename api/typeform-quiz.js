@@ -1,86 +1,95 @@
+// api/typeform-quiz.js
 export default async function handler(req, res) {
   if (req.method !== "POST") {
     return res.status(405).json({ error: "Method not allowed" });
   }
 
+  // --- Env
   const KLAVIYO_API_KEY = process.env.KLAVIYO_API_KEY;
-  // Debug: maskerad nyckelkontroll (syns i Vercel Logs)
-console.log(
-  "Key check:", (process.env.KLAVIYO_API_KEY || "").length, "chars; last4:",
-  (process.env.KLAVIYO_API_KEY || "").slice(-4)
-);
-
-  const TYPEFORM_SECRET = process.env.TYPEFORM_SECRET;
+  const TYPEFORM_SECRET = process.env.TYPEFORM_SECRET; // (valfri, ej strikt verifiering här)
   const KLAVIYO_METRIC = process.env.KLAVIYO_METRIC || "Fager Bit Quiz Completed";
 
+  // (valfri debug – kan tas bort när allt rullar)
+  console.log(
+    "Key check:",
+    (KLAVIYO_API_KEY || "").length,
+    "chars; last4:",
+    (KLAVIYO_API_KEY || "").slice(-4)
+  );
+
   try {
-    const body =
-      typeof req.body === "string" ? JSON.parse(req.body) : req.body;
+    // --- Body
+    const body = typeof req.body === "string" ? JSON.parse(req.body) : req.body;
     const fr = body?.form_response || {};
 
-    // Hämta e-postadress
+    // --- Email
     const email =
-      (fr.answers || []).find((a) => a.type === "email")?.email ||
+      (fr.answers || []).find((a) => a?.type === "email")?.email ||
       fr.hidden?.email ||
       null;
 
     if (!email) {
       console.warn("No email found, skipping Klaviyo send.");
-      return res
-        .status(200)
-        .json({ ok: true, note: "No email in submission, skipping." });
+      return res.status(200).json({ ok: true, note: "No email in submission; skipping." });
     }
 
-    // Hämta quiz-data
+    // --- Quiz-data
     const ending =
-      fr.calculated?.outcome?.title ||
-      fr.hidden?.ending ||
+      fr?.calculated?.outcome?.title ||
+      fr?.hidden?.ending ||
       "unknown";
-    const quizName =
-      fr.hidden?.quiz_name || "FagerBitQuiz";
-    const source =
-      fr.hidden?.source || "Website";
-    const submittedAt =
-      fr.submitted_at || new Date().toISOString();
 
-    // Skicka 200 direkt till Typeform så den inte väntar
+    const quizName = fr?.hidden?.quiz_name || "FagerBitQuiz";
+    const source = fr?.hidden?.source || "Website";
+    const submittedAt = fr?.submitted_at || new Date().toISOString();
+
+    // --- Svara Typeform direkt (slipp väntetid/timeout där)
     res.status(200).json({ ok: true });
 
-    // ====== HJÄLPFUNKTION FÖR RETRY + TIMEOUT ======
-    function sleep(ms) {
-      return new Promise((r) => setTimeout(r, ms));
-    }
+    // --- Hjälpare: retry + timeout mot Klaviyo
+    async function postToKlaviyoWithRetry(eventBody) {
+      const url = "https://a.klaviyo.com/api/events/";
+      const maxRetries = 3;
+      const timeoutMs = 25000; // 25s
 
-    async function postToKlaviyo(
-      url,
-      opts,
-      { retries = 2, timeoutMs = 10000 } = {}
-    ) {
-      for (let attempt = 0; attempt <= retries; attempt++) {
+      for (let attempt = 1; attempt <= maxRetries; attempt++) {
         const controller = new AbortController();
-        const timer = setTimeout(() => controller.abort(), timeoutMs);
-        const start = Date.now();
+        const timeout = setTimeout(() => controller.abort(), timeoutMs);
+
         try {
-          const r = await fetch(url, { ...opts, signal: controller.signal });
-          clearTimeout(timer);
-          if (r.ok) return r;
-          const txt = await r.text().catch(() => "");
-          console.error("Klaviyo non-200", r.status, txt);
-          if (r.status >= 400 && r.status < 500) return r; // 4xx = ingen retry
-        } catch (e) {
-          console.error(
-            `Klaviyo fetch error attempt ${attempt} after ${
-              Date.now() - start
-            }ms:`,
-            e?.message || e
-          );
+          const resp = await fetch(url, {
+            method: "POST",
+            headers: {
+              "Content-Type": "application/json",
+              Accept: "application/json",
+              Authorization: `Klaviyo-API-Key ${KLAVIYO_API_KEY}`,
+              revision: "2023-07-15",
+            },
+            body: JSON.stringify(eventBody),
+            signal: controller.signal,
+          });
+
+          clearTimeout(timeout);
+
+          if (resp.ok) {
+            console.log(`Klaviyo OK on attempt ${attempt} for`, email, ending);
+            return resp;
+          } else {
+            const text = await resp.text().catch(() => "");
+            console.warn(`Klaviyo responded ${resp.status} on attempt ${attempt}: ${text}`);
+          }
+        } catch (err) {
+          console.error(`Klaviyo fetch error attempt ${attempt}:`, err?.message || err);
+          if (attempt === maxRetries) throw err;
+          // Exponential backoff: 2s, 4s
+          await new Promise((r) => setTimeout(r, 2000 * attempt));
+        } finally {
+          clearTimeout(timeout);
         }
-        await sleep(500 * Math.pow(2, attempt)); // 0.5s, 1s, 2s backoff
       }
-      throw new Error("Klaviyo fetch failed after retries");
     }
 
-    // ====== SKICKA TILL KLAVIYO ======
+    // --- Bygg event & skicka i bakgrunden
     queueMicrotask(async () => {
       try {
         if (!KLAVIYO_API_KEY) throw new Error("Missing KLAVIYO_API_KEY");
@@ -102,56 +111,7 @@ console.log(
           },
         };
 
- async function postToKlaviyoWithRetry(eventBody) {
-  const url = "https://a.klaviyo.com/api/events/";
-  const maxRetries = 3;
-  const timeoutMs = 25000; // 25 sekunder
-
-  for (let attempt = 1; attempt <= maxRetries; attempt++) {
-    const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), timeoutMs);
-
-    try {
-      const resp = await fetch(url, {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          Accept: "application/json",
-          Authorization: `Klaviyo-API-Key ${KLAVIYO_API_KEY}`,
-          revision: "2023-02-22",
-        },
-        body: JSON.stringify(eventBody),
-        signal: controller.signal,
-      });
-
-      clearTimeout(timeout);
-
-      if (resp.ok) {
-        console.log(`Klaviyo OK on attempt ${attempt}`);
-        return resp;
-      } else {
-        const text = await resp.text();
-        console.warn(`Klaviyo responded ${resp.status}: ${text}`);
-      }
-    } catch (err) {
-      console.error(`Klaviyo fetch error attempt ${attempt}:`, err.message);
-      if (attempt === maxRetries) throw err; // kasta efter sista försöket
-      await new Promise(r => setTimeout(r, 2000 * attempt)); // vänta lite längre mellan försöken
-    } finally {
-      clearTimeout(timeout);
-    }
-  }
-}
-
-// 🔽 Använd sedan denna rad istället för din gamla fetch:
-const resp = await postToKlaviyoWithRetry(eventBody);
-
-
-        if (resp?.ok) {
-          console.log("Klaviyo OK for", email, ending);
-        } else {
-          console.warn("Klaviyo responded non-OK for", email);
-        }
+        await postToKlaviyoWithRetry(eventBody);
       } catch (err) {
         console.error("Background error:", err);
       }
