@@ -6,10 +6,9 @@ export default async function handler(req, res) {
   }
 
   const KLAVIYO_API_KEY = process.env.KLAVIYO_API_KEY;
-  const KLAVIYO_METRIC = process.env.KLAVIYO_METRIC || "Filled Out Form"; // <- namn
+  const KLAVIYO_METRIC = process.env.KLAVIYO_METRIC || "Filled Out Form"; // namn
   const TYPEFORM_SECRET = process.env.TYPEFORM_SECRET || "";
 
-  // Hjälpsam maskerad logg
   console.log(
     "Key check:",
     (KLAVIYO_API_KEY || "").length,
@@ -26,7 +25,7 @@ export default async function handler(req, res) {
     const body = typeof req.body === "string" ? JSON.parse(req.body) : req.body;
     const fr = body?.form_response || {};
 
-    // (Valfritt) enkel secret-kontroll
+    // (Valfritt) Secret-kontroll
     if (TYPEFORM_SECRET) {
       const sentSecret =
         body?.secret ||
@@ -38,7 +37,7 @@ export default async function handler(req, res) {
       }
     }
 
-    // E-post
+    // E-post (krävs för att skapa/uppdatera profil i eventet)
     const email =
       (fr.answers || []).find((a) => a?.type === "email" && a?.email)?.email ||
       fr.hidden?.email ||
@@ -49,7 +48,7 @@ export default async function handler(req, res) {
       return res.status(200).json({ ok: true, note: "No email; skipping." });
     }
 
-    // Quiz-data
+    // Quiz-properties
     const ending =
       fr?.calculated?.outcome?.title || fr?.hidden?.ending || "unknown";
     const quizName = fr?.hidden?.quiz_name || "FagerBitQuiz";
@@ -57,15 +56,13 @@ export default async function handler(req, res) {
     const submittedAt = fr?.submitted_at || new Date().toISOString();
     const formId = fr?.form_id || null;
 
-    // Event enligt “bredast kompatibla” modellen:
-    // - metric: i attributes.metric (namn)
-    // - profile: som relationship (med id=$email:<email>)
-    // - time: ISO8601
+    // Event enligt Klaviyo JSON:API med revision-header
     const eventBody = {
       data: {
         type: "event",
         attributes: {
-          metric: { name: KLAVIYO_METRIC }, // <- namn, inte relationship
+          // Viktigt: metric anges här med NAMN
+          metric: { name: KLAVIYO_METRIC },
           properties: {
             quiz_name: quizName,
             quiz_result: ending,
@@ -73,10 +70,10 @@ export default async function handler(req, res) {
             submitted_at: submittedAt,
             ...(formId ? { formId } : {}),
           },
-          profile: { email },  // vissa miljöer accepterar även denna i attributes
-          time: submittedAt,
+          occurred_at: submittedAt, // använd occurred_at med revision
         },
         relationships: {
+          // Profil kopplas via relationship med special-id $email:<email>
           profile: {
             data: { type: "profile", id: `$email:${email}` },
           },
@@ -84,7 +81,6 @@ export default async function handler(req, res) {
       },
     };
 
-    // Skicka till Klaviyo (utan revision-header)
     const controller = new AbortController();
     const timeout = setTimeout(() => controller.abort(), 8000);
 
@@ -96,10 +92,13 @@ export default async function handler(req, res) {
           "Content-Type": "application/json",
           Accept: "application/json",
           Authorization: `Klaviyo-API-Key ${KLAVIYO_API_KEY}`,
+          // Krävda schema-versionen (datumformat YYYY-MM-DD)
+          revision: "2024-10-15",
         },
         body: JSON.stringify(eventBody),
         signal: controller.signal,
       });
+
       clearTimeout(timeout);
 
       if (!resp.ok) {
@@ -113,7 +112,6 @@ export default async function handler(req, res) {
       console.error("Klaviyo fetch error:", err?.message || err);
     }
 
-    // Svara alltid 200 till Typeform
     return res.status(200).json({ ok: true });
   } catch (err) {
     console.error("Handler error:", err);
