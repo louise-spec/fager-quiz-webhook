@@ -1,7 +1,7 @@
 // /api/typeform-quiz.js
 // Fager Quiz → Klaviyo Events API (Create Event, metric by name)
 // + GDPR-samtycke från Typeform legal-fråga (ref: 318e5266-b416-4f99-acf3-17549aacf2f0)
-// Om consent = true → profilen får consent ["email"] (Subscribed)
+// Om consent = true → profilen får subscriptions.email.marketing.consent = SUBSCRIBED
 
 export default async function handler(req, res) {
   if (req.method !== "POST") return res.status(405).json({ error: "Method not allowed" });
@@ -17,8 +17,7 @@ export default async function handler(req, res) {
   }
 
   // === Typeform field refs ===
-  // Legal consent block: "Would you like to continue receive marketing email från Fager?"
-  const CONSENT_REF = "318e5266-b416-4f99-acf3-17549aacf2f0";
+  const CONSENT_REF = "318e5266-b416-4f99-acf3-17549aacf2f0"; // legal-block
 
   // === Helpers ===
   const slugify = (s) =>
@@ -35,7 +34,7 @@ export default async function handler(req, res) {
     const body = typeof req.body === "string" ? JSON.parse(req.body) : req.body;
     const fr = body?.form_response || {};
 
-    // Skip Typeform "Send test request" payloads
+    // Skip Typeform "Send test request"
     const isTypeformTest =
       fr?.hidden?.quiz_name === "hidden_value" ||
       fr?.hidden?.ending === "hidden_value" ||
@@ -54,25 +53,22 @@ export default async function handler(req, res) {
       return res.status(200).json({ ok: true, note: "Typeform test – skipped Klaviyo" });
     }
 
-    // === Email extraction ===
+    // === Email ===
     const email =
       (fr.answers || []).find((a) => a?.type === "email" && a?.email)?.email ||
       fr.hidden?.email ||
       null;
-
     if (!email) {
       console.warn("⚠️ No email in submission; skipping Klaviyo send.");
       return res.status(200).json({ ok: true, note: "No email; skipping." });
     }
 
-    // === Consent extraction (Typeform 'legal' answer -> boolean) ===
+    // === Consent from legal question (boolean) ===
     const consentAns = (fr.answers || []).find((a) => a?.field?.ref === CONSENT_REF);
-    // legal-typ returnerar boolean, men vi lägger in lite fallback om någon gång skulle vara choice/text
     const consentGiven =
       consentAns?.boolean === true ||
       (typeof consentAns?.choice?.label === "string" &&
-        /accept|yes/i.test(consentAns.choice.label)) ||
-      (typeof consentAns?.text === "string" && /accept|yes/i.test(consentAns.text));
+        /accept|yes/i.test(consentAns.choice.label));
 
     // === Quiz fields ===
     const endingTitle = fr?.calculated?.outcome?.title || fr?.hidden?.ending || "Unknown";
@@ -82,6 +78,23 @@ export default async function handler(req, res) {
     const submittedAt = fr?.submitted_at || new Date().toISOString();
 
     console.log("🧩 Ending detected:", endingTitle, "→", ending_key, "| consent:", !!consentGiven);
+
+    // === Profile attributes payload (subscriptions för samtycke) ===
+    const profileAttributes = consentGiven
+      ? {
+          email,
+          subscriptions: {
+            email: {
+              marketing: {
+                consent: "SUBSCRIBED",
+                timestamp: submittedAt,
+                method: "Typeform",
+                method_detail: "Fager Quiz consent question",
+              },
+            },
+          },
+        }
+      : { email };
 
     // === Klaviyo Create Event payload (nested metric/profile) ===
     const eventBody = {
@@ -96,7 +109,7 @@ export default async function handler(req, res) {
             submitted_at: submittedAt,
             typeform_form_id: fr?.form_id,
             typeform_response_id: fr?.token,
-            consent_given: !!consentGiven, // bra för felsökning i Klaviyo
+            consent_given: !!consentGiven,
           },
           time: submittedAt,
           metric: {
@@ -108,21 +121,15 @@ export default async function handler(req, res) {
           profile: {
             data: {
               type: "profile",
-              attributes: consentGiven
-                ? { email, consent: ["email"] } // ← gör profilen Subscribed
-                : { email }, // ← lämna som Never Subscribed
+              attributes: profileAttributes,
             },
           },
-          // unique_id: fr?.token, // valfritt: för att säkra mot duplikat
+          // unique_id: fr?.token, // valfritt
         },
       },
     };
 
-    console.log(
-      "📤 Posting to Klaviyo (revision=2024-07-15, metric name:",
-      KLAVIYO_METRIC_NAME,
-      ")"
-    );
+    console.log("📤 Posting to Klaviyo (revision=2024-07-15, metric name:", KLAVIYO_METRIC_NAME, ")");
 
     const resp = await fetch("https://a.klaviyo.com/api/events/", {
       method: "POST",
