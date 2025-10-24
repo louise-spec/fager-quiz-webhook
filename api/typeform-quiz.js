@@ -1,15 +1,16 @@
 // /api/typeform-quiz.js
-// 1) Upsert profile (set marketing consent if "legal" == true)
-// 2) Create Event (metric by name, nested schema)
-// Compatible with Klaviyo revision 2024-07-15
+// 1) Upsert profile (email only)
+// 2) If consent=true: subscribe profile to List (via /api/lists/{LIST_ID}/relationships/profiles)
+// 3) Create Event (metric by name, nested schema, revision 2024-07-15)
 
 export default async function handler(req, res) {
   if (req.method !== "POST") return res.status(405).json({ error: "Method not allowed" });
 
-  const KLAVIYO_API_KEY   = process.env.KLAVIYO_API_KEY;
+  const KLAVIYO_API_KEY     = process.env.KLAVIYO_API_KEY;
   const KLAVIYO_METRIC_NAME = process.env.KLAVIYO_METRIC_NAME || "Fager Quiz Completed";
-  const TYPEFORM_SECRET   = process.env.TYPEFORM_SECRET || "";
-  const CONSENT_REF       = "318e5266-b416-4f99-acf3-17549aacf2f0"; // Typeform legal question ref
+  const KLAVIYO_LIST_ID     = process.env.KLAVIYO_LIST_ID || ""; // <-- sätt detta i Vercel
+  const TYPEFORM_SECRET     = process.env.TYPEFORM_SECRET || "";
+  const CONSENT_REF         = "318e5266-b416-4f99-acf3-17549aacf2f0"; // Typeform legal (boolean)
 
   if (!KLAVIYO_API_KEY) {
     console.error("❌ Missing KLAVIYO_API_KEY");
@@ -26,7 +27,7 @@ export default async function handler(req, res) {
     const body = typeof req.body === "string" ? JSON.parse(req.body) : req.body;
     const fr   = body?.form_response || {};
 
-    // Skip Typeform "Send test request"
+    // Skip Typeform test payloads
     const isTypeformTest =
       fr?.hidden?.quiz_name === "hidden_value" ||
       fr?.hidden?.ending    === "hidden_value" ||
@@ -66,71 +67,65 @@ export default async function handler(req, res) {
 
     console.log("🧩 Ending:", endingTitle, "→", ending_key, "| consent:", consentGiven);
 
-    // ========= 1) UPSERT PROFILE (set subscriptions only here) =========
-    if (consentGiven) {
-      const profilePayload = {
-        data: {
-          type: "profile",
-          attributes: {
-            email,
-            subscriptions: {
-              email: {
-                marketing: {
-                  consent: "SUBSCRIBED",
-                  timestamp: submittedAt,
-                  method: "Typeform",
-                  method_detail: "Fager Quiz legal consent"
-                }
-              }
-            }
-          }
-        }
-      };
+    // ========= 1) UPSERT PROFILE (email only) =========
+    try {
+      const pResp = await fetch("https://a.klaviyo.com/api/profiles/", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Accept: "application/json",
+          Authorization: `Klaviyo-API-Key ${KLAVIYO_API_KEY}`,
+          revision: "2024-07-15",
+        },
+        body: JSON.stringify({ data: { type: "profile", attributes: { email } } }),
+      });
 
-      try {
-        const pResp = await fetch("https://a.klaviyo.com/api/profiles/", {
-          method: "POST",
-          headers: {
-            "Content-Type": "application/json",
-            Accept: "application/json",
-            Authorization: `Klaviyo-API-Key ${KLAVIYO_API_KEY}`,
-            revision: "2024-07-15"
-          },
-          body: JSON.stringify(profilePayload)
-        });
-
-        if (!pResp.ok) {
-          const t = await pResp.text().catch(() => "");
-          console.error("❌ Klaviyo profile upsert error:", pResp.status, t?.slice(0, 800));
-        } else {
-          console.log("✅ Klaviyo profile upserted with SUBSCRIBED consent:", email);
-        }
-      } catch (e) {
-        console.error("❌ Klaviyo profile upsert fetch error:", e?.message || e);
+      if (!pResp.ok) {
+        const t = await pResp.text().catch(() => "");
+        console.warn("⚠️ Profile upsert non-OK:", pResp.status, t?.slice(0, 800));
+      } else {
+        console.log("✅ Profile upserted (email only):", email);
       }
-    } else {
-      // Upsert minimal profile (utan att sätta subscriptions), så eventet säkert knyts rätt
-      try {
-        const pResp2 = await fetch("https://a.klaviyo.com/api/profiles/", {
-          method: "POST",
-          headers: {
-            "Content-Type": "application/json",
-            Accept: "application/json",
-            Authorization: `Klaviyo-API-Key ${KLAVIYO_API_KEY}`,
-            revision: "2024-07-15"
-          },
-          body: JSON.stringify({ data: { type: "profile", attributes: { email } } })
-        });
-        if (!pResp2.ok) {
-          const t2 = await pResp2.text().catch(() => "");
-          console.warn("⚠️ Minimal profile upsert non-OK:", pResp2.status, t2?.slice(0, 800));
-        }
-      } catch (e) {
-        console.warn("⚠️ Minimal profile upsert fetch error:", e?.message || e);
-      }
+    } catch (e) {
+      console.warn("⚠️ Profile upsert fetch error:", e?.message || e);
     }
 
-    // ========= 2) CREATE EVENT =========
+    // ========= 2) SUBSCRIBE TO LIST (if consent) =========
+    if (consentGiven && KLAVIYO_LIST_ID) {
+      try {
+        // Link profile to list by email-identifier
+        const listPayload = {
+          data: [{ type: "profile", id: `$email:${email}` }],
+        };
+
+        const lResp = await fetch(
+          `https://a.klaviyo.com/api/lists/${encodeURIComponent(KLAVIYO_LIST_ID)}/relationships/profiles/`,
+          {
+            method: "POST",
+            headers: {
+              "Content-Type": "application/json",
+              Accept: "application/json",
+              Authorization: `Klaviyo-API-Key ${KLAVIYO_API_KEY}`,
+              revision: "2024-07-15",
+            },
+            body: JSON.stringify(listPayload),
+          }
+        );
+
+        if (!lResp.ok) {
+          const lt = await lResp.text().catch(() => "");
+          console.error("❌ List subscribe error:", lResp.status, lt?.slice(0, 800));
+        } else {
+          console.log("✅ Subscribed to list:", KLAVIYO_LIST_ID, "→", email);
+        }
+      } catch (e) {
+        console.error("❌ List subscribe fetch error:", e?.message || e);
+      }
+    } else if (consentGiven && !KLAVIYO_LIST_ID) {
+      console.warn("⚠️ Consent true, but KLAVIYO_LIST_ID is not set. Skipping list subscribe.");
+    }
+
+    // ========= 3) CREATE EVENT =========
     const eventBody = {
       data: {
         type: "event",
@@ -143,22 +138,21 @@ export default async function handler(req, res) {
             submitted_at: submittedAt,
             typeform_form_id: fr?.form_id,
             typeform_response_id: fr?.token,
-            consent_given: !!consentGiven
+            consent_given: !!consentGiven,
           },
           time: submittedAt,
           metric: {
-            data: { type: "metric", attributes: { name: KLAVIYO_METRIC_NAME } }
+            data: { type: "metric", attributes: { name: KLAVIYO_METRIC_NAME } },
           },
           profile: {
-            // referera bara med email här – inga subscriptions i eventet
-            data: { type: "profile", attributes: { email } }
-          }
-          // unique_id: fr?.token, // valfritt dedupe
-        }
-      }
+            data: { type: "profile", attributes: { email } }, // referens med email
+          },
+          // unique_id: fr?.token, // valfritt: dedupe
+        },
+      },
     };
 
-    console.log("📤 Posting Event to Klaviyo (revision=2024-07-15, metric:", KLAVIYO_METRIC_NAME, ")");
+    console.log("📤 Posting Event (revision=2024-07-15, metric:", KLAVIYO_METRIC_NAME, ")");
 
     const eResp = await fetch("https://a.klaviyo.com/api/events/", {
       method: "POST",
@@ -166,9 +160,9 @@ export default async function handler(req, res) {
         "Content-Type": "application/json",
         Accept: "application/json",
         Authorization: `Klaviyo-API-Key ${KLAVIYO_API_KEY}`,
-        revision: "2024-07-15"
+        revision: "2024-07-15",
       },
-      body: JSON.stringify(eventBody)
+      body: JSON.stringify(eventBody),
     });
 
     if (!eResp.ok) {
@@ -177,7 +171,12 @@ export default async function handler(req, res) {
       return res.status(200).json({ ok: false, upstream: "klaviyo", status: eResp.status });
     }
 
-    console.log("✅ Klaviyo OK", { email, consent: !!consentGiven, ending_key, metric_name: KLAVIYO_METRIC_NAME });
+    console.log("✅ Klaviyo OK", {
+      email,
+      consent: !!consentGiven,
+      ending_key,
+      metric_name: KLAVIYO_METRIC_NAME,
+    });
     return res.status(200).json({ ok: true });
   } catch (err) {
     console.error("💥 Handler error:", err);
