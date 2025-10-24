@@ -1,10 +1,10 @@
 // /api/typeform-quiz.js
-// Typeform → Klaviyo: (1) Upsert profile, (2) Subscribe (consent + list) via email-only + polling, (3) Send event
-// Env: KLAVIYO_API_KEY, KLAVIYO_LIST_ID, (opt) KLAVIYO_METRIC_NAME, TYPEFORM_SECRET
+// Vercel Serverless: Typeform → Klaviyo
+// (1) Upsert profile, (2) Subscribe (email consent + add to list) via email-only bulk job + polling, (3) Send event
 
 export default async function handler(req, res) {
   if (req.method !== "POST") return res.status(405).json({ error: "Method not allowed" });
-  console.log("▶️ Using Subscribe+Poll v2 (email-only)");
+  console.log("▶️ Using Serverless Subscribe+Poll v2 (email-only)");
 
   // === Env ===
   const KLAVIYO_API_KEY = process.env.KLAVIYO_API_KEY;
@@ -80,13 +80,13 @@ export default async function handler(req, res) {
     const body = typeof req.body === "string" ? JSON.parse(req.body) : req.body;
     const fr = body?.form_response || {};
 
-    // Typeform test payloads → skip
+    // Blockera Typeforms "Send test request"
     const isTypeformTest =
       fr?.hidden?.quiz_name === "hidden_value" ||
       fr?.hidden?.ending === "hidden_value" ||
       fr?.hidden?.source === "hidden_value";
 
-    // Optional secret check
+    // Valfri secret
     if (TYPEFORM_SECRET) {
       const sentSecret = body?.secret || fr?.hidden?.secret;
       if (sentSecret && sentSecret !== TYPEFORM_SECRET) {
@@ -100,7 +100,7 @@ export default async function handler(req, res) {
       return res.status(200).json({ ok: true, note: "Typeform test – skipped" });
     }
 
-    // Extract email
+    // Hämta e-post
     const email =
       (fr.answers || []).find((a) => a?.type === "email" && a?.email)?.email ||
       fr.hidden?.email ||
@@ -111,7 +111,7 @@ export default async function handler(req, res) {
       return res.status(200).json({ ok: true, note: "No email; skipping" });
     }
 
-    // Quiz data
+    // Quizdata
     const endingTitle = fr?.calculated?.outcome?.title || fr?.hidden?.ending || "Unknown";
     const ending_key = slugify(endingTitle);
     const quiz_name = fr?.hidden?.quiz_name || "FagerBitQuiz";
@@ -121,12 +121,7 @@ export default async function handler(req, res) {
     console.log("🧩 Ending detected:", endingTitle, "→", ending_key);
 
     // --- (1) PROFILE UPSERT (ingen consent här) ---
-    const profileBody = {
-      data: {
-        type: "profile",
-        attributes: { email },
-      },
-    };
+    const profileBody = { data: { type: "profile", attributes: { email } } };
 
     console.log("👤 Upserting profile…");
     const profileResp = await kpost("https://a.klaviyo.com/api/profiles/", profileBody);
@@ -145,6 +140,7 @@ export default async function handler(req, res) {
     console.log("👤 Profile ID:", profileId);
 
     // --- (2) SUBSCRIBE (consent + add to list) via bulk-job (EMAIL-ONLY) + polling ---
+    // Skicka ENDAST email här så Klaviyo säkert matchar profilen och sätter consent korrekt
     const subscribeBody = {
       data: {
         type: "profile-subscription-bulk-create-job",
@@ -153,7 +149,6 @@ export default async function handler(req, res) {
             data: [
               {
                 type: "profile",
-                // 🔑 Viktigt: skicka ENDAST email här så Klaviyo matchar profilen själv
                 attributes: {
                   email,
                   subscriptions: {
@@ -170,11 +165,9 @@ export default async function handler(req, res) {
               },
             ],
           },
-          // Lämna historical_import bort (vi vill trigga flows)
+          // historical_import utelämnas (annars triggar inte list-flows)
         },
-        relationships: {
-          list: { data: { type: "list", id: KLAVIYO_LIST_ID } },
-        },
+        relationships: { list: { data: { type: "list", id: KLAVIYO_LIST_ID } } },
       },
     };
 
@@ -192,16 +185,15 @@ export default async function handler(req, res) {
     console.log("Subscribe headers:", subscribeHeaders);
     console.log("Subscribe response (first 500):", subscribeTxtFirst.slice(0, 500));
 
-    if (!subscribeResp.ok || !jobUrl) {
-      console.error("❌ Subscribe Profiles error or missing job URL");
-    } else {
+    if (subscribeResp.ok && jobUrl) {
       const jobOk = await pollJob(jobUrl);
-      if (!jobOk) {
-        console.warn("⚠️ Consent/list may not be finalized yet; proceeding to event.");
-      }
+      if (!jobOk) console.warn("⚠️ Consent/list may not be finalized yet; proceeding to event.");
+    } else {
+      console.error("❌ Subscribe Profiles error or missing job URL");
+      // vi kör vidare till eventet så Typeform inte får rött, men consent kan saknas
     }
 
-    // --- (3) CREATE EVENT ---
+    // --- (3) EVENT ---
     const eventBody = {
       data: {
         type: "event",
