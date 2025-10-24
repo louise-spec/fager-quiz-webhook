@@ -1,10 +1,10 @@
 // /api/typeform-quiz.js
-// Typeform → Klaviyo: (1) Upsert profile, (2) Subscribe with consent (+list) w/ polling, (3) Send event
+// Typeform → Klaviyo: (1) Upsert profile, (2) Subscribe (consent + list) via email-only + polling, (3) Send event
 // Env: KLAVIYO_API_KEY, KLAVIYO_LIST_ID, (opt) KLAVIYO_METRIC_NAME, TYPEFORM_SECRET
 
 export default async function handler(req, res) {
   if (req.method !== "POST") return res.status(405).json({ error: "Method not allowed" });
-  console.log("▶️ Using Subscribe+Poll v1");
+  console.log("▶️ Using Subscribe+Poll v2 (email-only)");
 
   // === Env ===
   const KLAVIYO_API_KEY = process.env.KLAVIYO_API_KEY;
@@ -144,7 +144,7 @@ export default async function handler(req, res) {
     }
     console.log("👤 Profile ID:", profileId);
 
-    // --- (2) SUBSCRIBE (consent + add to list) via bulk-job + polling ---
+    // --- (2) SUBSCRIBE (consent + add to list) via bulk-job (EMAIL-ONLY) + polling ---
     const subscribeBody = {
       data: {
         type: "profile-subscription-bulk-create-job",
@@ -153,7 +153,7 @@ export default async function handler(req, res) {
             data: [
               {
                 type: "profile",
-                id: profileId,
+                // 🔑 Viktigt: skicka ENDAST email här så Klaviyo matchar profilen själv
                 attributes: {
                   email,
                   subscriptions: {
@@ -170,7 +170,7 @@ export default async function handler(req, res) {
               },
             ],
           },
-          // historical_import: false, // lämnas borta för att flows ska trigga
+          // Lämna historical_import bort (vi vill trigga flows)
         },
         relationships: {
           list: { data: { type: "list", id: KLAVIYO_LIST_ID } },
@@ -178,7 +178,7 @@ export default async function handler(req, res) {
       },
     };
 
-    console.log("✅ Subscribing profile with consent + list (creating job)...");
+    console.log("✅ Subscribing (email-only) with consent + list (creating job)...");
     const subscribeResp = await kpost(
       "https://a.klaviyo.com/api/profile-subscription-bulk-create-jobs/",
       subscribeBody
@@ -194,7 +194,6 @@ export default async function handler(req, res) {
 
     if (!subscribeResp.ok || !jobUrl) {
       console.error("❌ Subscribe Profiles error or missing job URL");
-      // Fortsätter ändå till event så Typeform får 200; men consent/list kan vara ofärdigt
     } else {
       const jobOk = await pollJob(jobUrl);
       if (!jobOk) {
