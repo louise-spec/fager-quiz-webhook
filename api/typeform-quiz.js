@@ -1,11 +1,12 @@
 // /api/typeform-quiz.js
-// Typeform → Klaviyo: (1) Upsert profile, (2) Subscribe with consent, (3) Send event
-// ✅ Handles consent + list + event automatically
-// Requires env vars: KLAVIYO_API_KEY, KLAVIYO_LIST_ID, (optional) KLAVIYO_METRIC_NAME, TYPEFORM_SECRET
+// Typeform → Klaviyo: (1) Upsert profile, (2) Subscribe with consent (+list) w/ polling, (3) Send event
+// Env: KLAVIYO_API_KEY, KLAVIYO_LIST_ID, (opt) KLAVIYO_METRIC_NAME, TYPEFORM_SECRET
 
 export default async function handler(req, res) {
   if (req.method !== "POST") return res.status(405).json({ error: "Method not allowed" });
+  console.log("▶️ Using Subscribe+Poll v1");
 
+  // === Env ===
   const KLAVIYO_API_KEY = process.env.KLAVIYO_API_KEY;
   const KLAVIYO_LIST_ID = process.env.KLAVIYO_LIST_ID;
   const KLAVIYO_METRIC_NAME = process.env.KLAVIYO_METRIC_NAME || "Fager Quiz Completed";
@@ -16,7 +17,8 @@ export default async function handler(req, res) {
     return res.status(500).json({ error: "Server not configured" });
   }
 
-  const kfetch = (url, body) =>
+  // === Helpers ===
+  const kpost = (url, body) =>
     fetch(url, {
       method: "POST",
       headers: {
@@ -26,6 +28,16 @@ export default async function handler(req, res) {
         revision: "2024-07-15",
       },
       body: JSON.stringify(body),
+    });
+
+  const kget = (url) =>
+    fetch(url, {
+      method: "GET",
+      headers: {
+        Accept: "application/json",
+        Authorization: `Klaviyo-API-Key ${KLAVIYO_API_KEY}`,
+        revision: "2024-07-15",
+      },
     });
 
   const slugify = (s) =>
@@ -38,16 +50,43 @@ export default async function handler(req, res) {
       .replace(/^_+|_+$/g, "")
       .slice(0, 60) || "unknown";
 
+  const pollJob = async (url, timeoutMs = 45000, intervalMs = 3000) => {
+    const started = Date.now();
+    while (Date.now() - started < timeoutMs) {
+      const r = await kget(url);
+      const t = await r.text().catch(() => "");
+      let json = null;
+      try { json = JSON.parse(t); } catch {}
+      const state =
+        json?.data?.attributes?.status ||
+        json?.data?.attributes?.job_status ||
+        "unknown";
+      console.log(`🔄 Subscribe job status: ${state}`);
+      if (state === "succeeded" || state === "completed" || state === "complete") {
+        console.log("🎉 Subscribe job completed");
+        return true;
+      }
+      if (state === "failed" || state === "error") {
+        console.error("❌ Subscribe job failed:", t.slice(0, 800));
+        return false;
+      }
+      await new Promise((r) => setTimeout(r, intervalMs));
+    }
+    console.warn("⏱️ Subscribe job polling timed out");
+    return false;
+  };
+
   try {
     const body = typeof req.body === "string" ? JSON.parse(req.body) : req.body;
     const fr = body?.form_response || {};
 
-    // Skip Typeform test payloads
+    // Typeform test payloads → skip
     const isTypeformTest =
       fr?.hidden?.quiz_name === "hidden_value" ||
       fr?.hidden?.ending === "hidden_value" ||
       fr?.hidden?.source === "hidden_value";
 
+    // Optional secret check
     if (TYPEFORM_SECRET) {
       const sentSecret = body?.secret || fr?.hidden?.secret;
       if (sentSecret && sentSecret !== TYPEFORM_SECRET) {
@@ -66,6 +105,7 @@ export default async function handler(req, res) {
       (fr.answers || []).find((a) => a?.type === "email" && a?.email)?.email ||
       fr.hidden?.email ||
       null;
+
     if (!email) {
       console.warn("⚠️ No email in submission; skipping Klaviyo send.");
       return res.status(200).json({ ok: true, note: "No email; skipping" });
@@ -80,7 +120,7 @@ export default async function handler(req, res) {
 
     console.log("🧩 Ending detected:", endingTitle, "→", ending_key);
 
-    // (1) PROFILE UPSERT (no consent here)
+    // --- (1) PROFILE UPSERT (ingen consent här) ---
     const profileBody = {
       data: {
         type: "profile",
@@ -88,21 +128,23 @@ export default async function handler(req, res) {
       },
     };
 
-    console.log("👤 Upserting profile...");
-    const profileResp = await kfetch("https://a.klaviyo.com/api/profiles/", profileBody);
+    console.log("👤 Upserting profile…");
+    const profileResp = await kpost("https://a.klaviyo.com/api/profiles/", profileBody);
+    const profileTxt = await profileResp.text().catch(() => "");
     if (!profileResp.ok) {
-      const txt = await profileResp.text().catch(() => "");
-      console.error("❌ Profile upsert error:", profileResp.status, txt.slice(0, 800));
-      return res.status(200).json({ ok: false, step: "profile_upsert" });
+      console.error("❌ Profile upsert error:", profileResp.status, profileTxt.slice(0, 800));
+      return res.status(200).json({ ok: false, step: "profile_upsert", status: profileResp.status });
     }
-    const profileJson = await profileResp.json().catch(() => ({}));
+    let profileJson = {};
+    try { profileJson = JSON.parse(profileTxt); } catch {}
     const profileId = profileJson?.data?.id;
     if (!profileId) {
       console.error("❌ No profile ID returned");
       return res.status(200).json({ ok: false, step: "profile_id_missing" });
     }
+    console.log("👤 Profile ID:", profileId);
 
-    // (2) SUBSCRIBE PROFILES (consent + add to list)
+    // --- (2) SUBSCRIBE (consent + add to list) via bulk-job + polling ---
     const subscribeBody = {
       data: {
         type: "profile-subscription-bulk-create-job",
@@ -128,6 +170,7 @@ export default async function handler(req, res) {
               },
             ],
           },
+          // historical_import: false, // lämnas borta för att flows ska trigga
         },
         relationships: {
           list: { data: { type: "list", id: KLAVIYO_LIST_ID } },
@@ -135,18 +178,31 @@ export default async function handler(req, res) {
       },
     };
 
-    console.log("✅ Subscribing profile with consent + list...");
-    const subscribeResp = await kfetch(
+    console.log("✅ Subscribing profile with consent + list (creating job)...");
+    const subscribeResp = await kpost(
       "https://a.klaviyo.com/api/profile-subscription-bulk-create-jobs/",
       subscribeBody
     );
-    if (!subscribeResp.ok) {
-      const txt = await subscribeResp.text().catch(() => "");
-      console.error("❌ Subscribe Profiles error:", subscribeResp.status, txt.slice(0, 800));
-      return res.status(200).json({ ok: false, step: "subscribe_profiles" });
+    const subscribeStatus = subscribeResp.status;
+    const subscribeHeaders = Object.fromEntries(subscribeResp.headers.entries());
+    const jobUrl = subscribeHeaders["content-location"] || subscribeHeaders["location"] || null;
+    const subscribeTxtFirst = await subscribeResp.text().catch(() => "");
+
+    console.log("Subscribe status:", subscribeStatus);
+    console.log("Subscribe headers:", subscribeHeaders);
+    console.log("Subscribe response (first 500):", subscribeTxtFirst.slice(0, 500));
+
+    if (!subscribeResp.ok || !jobUrl) {
+      console.error("❌ Subscribe Profiles error or missing job URL");
+      // Fortsätter ändå till event så Typeform får 200; men consent/list kan vara ofärdigt
+    } else {
+      const jobOk = await pollJob(jobUrl);
+      if (!jobOk) {
+        console.warn("⚠️ Consent/list may not be finalized yet; proceeding to event.");
+      }
     }
 
-    // (3) EVENT
+    // --- (3) CREATE EVENT ---
     const eventBody = {
       data: {
         type: "event",
@@ -163,16 +219,17 @@ export default async function handler(req, res) {
           time: submittedAt,
           metric: { data: { type: "metric", attributes: { name: KLAVIYO_METRIC_NAME } } },
           profile: { data: { type: "profile", id: profileId } },
+          // unique_id: fr?.token, // valfritt dedupe
         },
       },
     };
 
     console.log("📤 Posting Event:", KLAVIYO_METRIC_NAME);
-    const eventResp = await kfetch("https://a.klaviyo.com/api/events/", eventBody);
+    const eventResp = await kpost("https://a.klaviyo.com/api/events/", eventBody);
+    const eventTxt = await eventResp.text().catch(() => "");
     if (!eventResp.ok) {
-      const txt = await eventResp.text().catch(() => "");
-      console.error("❌ Klaviyo Event error:", eventResp.status, txt.slice(0, 800));
-      return res.status(200).json({ ok: false, step: "event" });
+      console.error("❌ Klaviyo Event error:", eventResp.status, eventTxt.slice(0, 800));
+      return res.status(200).json({ ok: false, step: "event", status: eventResp.status });
     }
 
     console.log("✅ All good:", { email, ending_key });
