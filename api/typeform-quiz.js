@@ -156,8 +156,7 @@ export default async function handler(req, res) {
                       marketing: {
                         consent: "SUBSCRIBED",
                         consented_at: new Date().toISOString(),
-                        method: "Typeform Quiz",
-                        method_detail: source,
+                        method: "Typeform Quiz"
                       },
                     },
                   },
