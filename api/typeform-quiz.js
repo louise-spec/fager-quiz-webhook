@@ -1,7 +1,7 @@
 // /api/typeform-quiz.js
-// Fager Quiz → Klaviyo Events API (Create Event)
-// Uses metric-by-name with the correct nested schema under attributes.metric/profile
-// and a modern revision. Skips Typeform test payloads and always 200s to Typeform.
+// Fager Quiz → Klaviyo Events API (Create Event, metric by name)
+// + GDPR-samtycke från Typeform legal-fråga (ref: 318e5266-b416-4f99-acf3-17549aacf2f0)
+// Om consent = true → profilen får consent ["email"] (Subscribed)
 
 export default async function handler(req, res) {
   if (req.method !== "POST") return res.status(405).json({ error: "Method not allowed" });
@@ -15,6 +15,10 @@ export default async function handler(req, res) {
     console.error("❌ Missing KLAVIYO_API_KEY");
     return res.status(500).json({ error: "Server not configured" });
   }
+
+  // === Typeform field refs ===
+  // Legal consent block: "Would you like to continue receive marketing email från Fager?"
+  const CONSENT_REF = "318e5266-b416-4f99-acf3-17549aacf2f0";
 
   // === Helpers ===
   const slugify = (s) =>
@@ -31,13 +35,12 @@ export default async function handler(req, res) {
     const body = typeof req.body === "string" ? JSON.parse(req.body) : req.body;
     const fr = body?.form_response || {};
 
-    // Typeform "Send test request" uses 'hidden_value'
+    // Skip Typeform "Send test request" payloads
     const isTypeformTest =
       fr?.hidden?.quiz_name === "hidden_value" ||
       fr?.hidden?.ending === "hidden_value" ||
       fr?.hidden?.source === "hidden_value";
 
-    // Optional secret check
     if (TYPEFORM_SECRET) {
       const sentSecret = body?.secret || fr?.hidden?.secret;
       if (sentSecret && sentSecret !== TYPEFORM_SECRET) {
@@ -51,7 +54,7 @@ export default async function handler(req, res) {
       return res.status(200).json({ ok: true, note: "Typeform test – skipped Klaviyo" });
     }
 
-    // Extract email
+    // === Email extraction ===
     const email =
       (fr.answers || []).find((a) => a?.type === "email" && a?.email)?.email ||
       fr.hidden?.email ||
@@ -62,16 +65,25 @@ export default async function handler(req, res) {
       return res.status(200).json({ ok: true, note: "No email; skipping." });
     }
 
-    // Quiz fields
+    // === Consent extraction (Typeform 'legal' answer -> boolean) ===
+    const consentAns = (fr.answers || []).find((a) => a?.field?.ref === CONSENT_REF);
+    // legal-typ returnerar boolean, men vi lägger in lite fallback om någon gång skulle vara choice/text
+    const consentGiven =
+      consentAns?.boolean === true ||
+      (typeof consentAns?.choice?.label === "string" &&
+        /accept|yes/i.test(consentAns.choice.label)) ||
+      (typeof consentAns?.text === "string" && /accept|yes/i.test(consentAns.text));
+
+    // === Quiz fields ===
     const endingTitle = fr?.calculated?.outcome?.title || fr?.hidden?.ending || "Unknown";
     const ending_key = slugify(endingTitle);
     const quiz_name = fr?.hidden?.quiz_name || "FagerBitQuiz";
     const source = fr?.hidden?.source || "Website";
     const submittedAt = fr?.submitted_at || new Date().toISOString();
 
-    console.log("🧩 Ending detected:", endingTitle, "→", ending_key);
+    console.log("🧩 Ending detected:", endingTitle, "→", ending_key, "| consent:", !!consentGiven);
 
-    // === Klaviyo Create Event payload (correct nested schema) ===
+    // === Klaviyo Create Event payload (nested metric/profile) ===
     const eventBody = {
       data: {
         type: "event",
@@ -83,28 +95,34 @@ export default async function handler(req, res) {
             source,
             submitted_at: submittedAt,
             typeform_form_id: fr?.form_id,
-            typeform_response_id: fr?.token
+            typeform_response_id: fr?.token,
+            consent_given: !!consentGiven, // bra för felsökning i Klaviyo
           },
           time: submittedAt,
           metric: {
             data: {
               type: "metric",
-              attributes: { name: KLAVIYO_METRIC_NAME }
-            }
+              attributes: { name: KLAVIYO_METRIC_NAME },
+            },
           },
           profile: {
             data: {
               type: "profile",
-              attributes: { email }
-            }
-          }
-          // Optionally add a unique_id to prevent dedupe if sending multiple events at the same second:
-          // unique_id: fr?.token || crypto.randomUUID(),
-        }
-      }
+              attributes: consentGiven
+                ? { email, consent: ["email"] } // ← gör profilen Subscribed
+                : { email }, // ← lämna som Never Subscribed
+            },
+          },
+          // unique_id: fr?.token, // valfritt: för att säkra mot duplikat
+        },
+      },
     };
 
-    console.log("📤 Posting to Klaviyo (revision=2024-07-15, metric name:", KLAVIYO_METRIC_NAME, ")");
+    console.log(
+      "📤 Posting to Klaviyo (revision=2024-07-15, metric name:",
+      KLAVIYO_METRIC_NAME,
+      ")"
+    );
 
     const resp = await fetch("https://a.klaviyo.com/api/events/", {
       method: "POST",
@@ -112,19 +130,23 @@ export default async function handler(req, res) {
         "Content-Type": "application/json",
         Accept: "application/json",
         Authorization: `Klaviyo-API-Key ${KLAVIYO_API_KEY}`,
-        revision: "2024-07-15" // modern Events API revision that supports nested metric/profile under attributes
+        revision: "2024-07-15",
       },
-      body: JSON.stringify(eventBody)
+      body: JSON.stringify(eventBody),
     });
 
     if (!resp.ok) {
       const txt = await resp.text().catch(() => "");
       console.error("❌ Klaviyo error:", resp.status, txt?.slice(0, 1200));
-      // Still return 200 to keep Typeform green
       return res.status(200).json({ ok: false, upstream: "klaviyo", status: resp.status });
     }
 
-    console.log("✅ Klaviyo OK", { email, ending_key, metric_name: KLAVIYO_METRIC_NAME });
+    console.log("✅ Klaviyo OK", {
+      email,
+      consent: !!consentGiven,
+      ending_key,
+      metric_name: KLAVIYO_METRIC_NAME,
+    });
     return res.status(200).json({ ok: true });
   } catch (err) {
     console.error("💥 Handler error:", err);
