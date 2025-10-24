@@ -154,8 +154,7 @@ export default async function handler(req, res) {
                   subscriptions: {
                     email: {
                       marketing: {
-                        consent: "SUBSCRIBED",
-                        consented_at: new Date().toISOString()
+                        consent: "SUBSCRIBED"
                       },
                     },
                   },
