@@ -1,25 +1,21 @@
 // /api/typeform-quiz.js
-// Typeform → Klaviyo: (1) Profile upsert + consent, (2) List subscribe, (3) Create event
+// Typeform → Klaviyo: (1) Upsert profile, (2) Subscribe with consent, (3) Send event
+// ✅ Handles consent + list + event automatically
+// Requires env vars: KLAVIYO_API_KEY, KLAVIYO_LIST_ID, (optional) KLAVIYO_METRIC_NAME, TYPEFORM_SECRET
 
 export default async function handler(req, res) {
   if (req.method !== "POST") return res.status(405).json({ error: "Method not allowed" });
 
-  // === Env ===
   const KLAVIYO_API_KEY = process.env.KLAVIYO_API_KEY;
-  const KLAVIYO_LIST_ID = process.env.KLAVIYO_LIST_ID; // <-- SET THIS (list: "Typeform bitquiz new")
+  const KLAVIYO_LIST_ID = process.env.KLAVIYO_LIST_ID;
   const KLAVIYO_METRIC_NAME = process.env.KLAVIYO_METRIC_NAME || "Fager Quiz Completed";
   const TYPEFORM_SECRET = process.env.TYPEFORM_SECRET || "";
 
-  if (!KLAVIYO_API_KEY) {
-    console.error("❌ Missing KLAVIYO_API_KEY");
-    return res.status(500).json({ error: "Server not configured" });
-  }
-  if (!KLAVIYO_LIST_ID) {
-    console.error("❌ Missing KLAVIYO_LIST_ID (List ID for 'Typeform bitquiz new')");
+  if (!KLAVIYO_API_KEY || !KLAVIYO_LIST_ID) {
+    console.error("❌ Missing env vars (KLAVIYO_API_KEY or KLAVIYO_LIST_ID)");
     return res.status(500).json({ error: "Server not configured" });
   }
 
-  // Small helper for Klaviyo calls
   const kfetch = (url, body) =>
     fetch(url, {
       method: "POST",
@@ -27,7 +23,6 @@ export default async function handler(req, res) {
         "Content-Type": "application/json",
         Accept: "application/json",
         Authorization: `Klaviyo-API-Key ${KLAVIYO_API_KEY}`,
-        // Klaviyo expects this exact lowercase header key:
         revision: "2024-07-15",
       },
       body: JSON.stringify(body),
@@ -47,13 +42,12 @@ export default async function handler(req, res) {
     const body = typeof req.body === "string" ? JSON.parse(req.body) : req.body;
     const fr = body?.form_response || {};
 
-    // Typeform "Send test request" uses 'hidden_value'
+    // Skip Typeform test payloads
     const isTypeformTest =
       fr?.hidden?.quiz_name === "hidden_value" ||
       fr?.hidden?.ending === "hidden_value" ||
       fr?.hidden?.source === "hidden_value";
 
-    // Optional secret check
     if (TYPEFORM_SECRET) {
       const sentSecret = body?.secret || fr?.hidden?.secret;
       if (sentSecret && sentSecret !== TYPEFORM_SECRET) {
@@ -64,7 +58,7 @@ export default async function handler(req, res) {
 
     if (isTypeformTest) {
       console.log("🧪 Typeform test payload – skipping Klaviyo");
-      return res.status(200).json({ ok: true, note: "Typeform test – skipped Klaviyo" });
+      return res.status(200).json({ ok: true, note: "Typeform test – skipped" });
     }
 
     // Extract email
@@ -72,13 +66,12 @@ export default async function handler(req, res) {
       (fr.answers || []).find((a) => a?.type === "email" && a?.email)?.email ||
       fr.hidden?.email ||
       null;
-
     if (!email) {
       console.warn("⚠️ No email in submission; skipping Klaviyo send.");
-      return res.status(200).json({ ok: true, note: "No email; skipping." });
+      return res.status(200).json({ ok: true, note: "No email; skipping" });
     }
 
-    // Quiz fields
+    // Quiz data
     const endingTitle = fr?.calculated?.outcome?.title || fr?.hidden?.ending || "Unknown";
     const ending_key = slugify(endingTitle);
     const quiz_name = fr?.hidden?.quiz_name || "FagerBitQuiz";
@@ -87,62 +80,73 @@ export default async function handler(req, res) {
 
     console.log("🧩 Ending detected:", endingTitle, "→", ending_key);
 
-    // --- (1) PROFILE UPSERT with explicit email marketing consent ---
+    // (1) PROFILE UPSERT (no consent here)
     const profileBody = {
       data: {
         type: "profile",
-        attributes: {
-          email,
-          subscriptions: {
-            email: {
-              marketing: {
-                consent: true,
-                timestamp: new Date().toISOString(), // consent time
-              },
-            },
-          },
-          // You can add more attributes if you want:
-          // first_name: ...,
-          // last_name: ...,
-          // properties: { quiz_name, source } // optional custom props
-        },
+        attributes: { email },
       },
     };
 
-    console.log("👤 Upserting profile with consent...");
+    console.log("👤 Upserting profile...");
     const profileResp = await kfetch("https://a.klaviyo.com/api/profiles/", profileBody);
     if (!profileResp.ok) {
       const txt = await profileResp.text().catch(() => "");
-      console.error("❌ Profile upsert error:", profileResp.status, txt?.slice(0, 1200));
-      // Return 200 so Typeform doesn't retry forever, but include note
-      return res.status(200).json({ ok: false, step: "profile_upsert", status: profileResp.status });
+      console.error("❌ Profile upsert error:", profileResp.status, txt.slice(0, 800));
+      return res.status(200).json({ ok: false, step: "profile_upsert" });
     }
     const profileJson = await profileResp.json().catch(() => ({}));
     const profileId = profileJson?.data?.id;
     if (!profileId) {
-      console.error("❌ No profile ID returned from Klaviyo.");
+      console.error("❌ No profile ID returned");
       return res.status(200).json({ ok: false, step: "profile_id_missing" });
     }
 
-    // --- (2) LIST SUBSCRIBE (creates the "Added to list" activity => triggers your Flow) ---
-    const listRelBody = {
-      data: [{ type: "profile", id: profileId }],
+    // (2) SUBSCRIBE PROFILES (consent + add to list)
+    const subscribeBody = {
+      data: {
+        type: "profile-subscription-bulk-create-job",
+        attributes: {
+          profiles: {
+            data: [
+              {
+                type: "profile",
+                id: profileId,
+                attributes: {
+                  email,
+                  subscriptions: {
+                    email: {
+                      marketing: {
+                        consent: "SUBSCRIBED",
+                        consented_at: new Date().toISOString(),
+                        method: "Typeform Quiz",
+                        method_detail: source,
+                      },
+                    },
+                  },
+                },
+              },
+            ],
+          },
+        },
+        relationships: {
+          list: { data: { type: "list", id: KLAVIYO_LIST_ID } },
+        },
+      },
     };
 
-    console.log("📝 Subscribing profile to list:", KLAVIYO_LIST_ID);
-    const listResp = await kfetch(
-      `https://a.klaviyo.com/api/lists/${KLAVIYO_LIST_ID}/relationships/profiles/`,
-      listRelBody
+    console.log("✅ Subscribing profile with consent + list...");
+    const subscribeResp = await kfetch(
+      "https://a.klaviyo.com/api/profile-subscription-bulk-create-jobs/",
+      subscribeBody
     );
-    if (!listResp.ok) {
-      const txt = await listResp.text().catch(() => "");
-      console.error("❌ List subscribe error:", listResp.status, txt?.slice(0, 1200));
-      // We still continue to create the event, but Flow won't trigger without this.
-      // Return 200 to keep Typeform green.
-      return res.status(200).json({ ok: false, step: "list_subscribe", status: listResp.status });
+    if (!subscribeResp.ok) {
+      const txt = await subscribeResp.text().catch(() => "");
+      console.error("❌ Subscribe Profiles error:", subscribeResp.status, txt.slice(0, 800));
+      return res.status(200).json({ ok: false, step: "subscribe_profiles" });
     }
 
-    // --- (3) CREATE EVENT (metric) ---
+    // (3) EVENT
     const eventBody = {
       data: {
         type: "event",
@@ -157,32 +161,21 @@ export default async function handler(req, res) {
             typeform_response_id: fr?.token,
           },
           time: submittedAt,
-          metric: {
-            data: {
-              type: "metric",
-              attributes: { name: KLAVIYO_METRIC_NAME },
-            },
-          },
-          profile: {
-            data: {
-              type: "profile",
-              id: profileId, // link to the same profile we just upserted
-            },
-          },
-          // unique_id: fr?.token, // optional dedupe key
+          metric: { data: { type: "metric", attributes: { name: KLAVIYO_METRIC_NAME } } },
+          profile: { data: { type: "profile", id: profileId } },
         },
       },
     };
 
-    console.log("📤 Posting Event (revision=2024-07-15, metric:", KLAVIYO_METRIC_NAME, ")");
+    console.log("📤 Posting Event:", KLAVIYO_METRIC_NAME);
     const eventResp = await kfetch("https://a.klaviyo.com/api/events/", eventBody);
     if (!eventResp.ok) {
       const txt = await eventResp.text().catch(() => "");
-      console.error("❌ Klaviyo Event error:", eventResp.status, txt?.slice(0, 1200));
-      return res.status(200).json({ ok: false, step: "event", status: eventResp.status });
+      console.error("❌ Klaviyo Event error:", eventResp.status, txt.slice(0, 800));
+      return res.status(200).json({ ok: false, step: "event" });
     }
 
-    console.log("✅ All good:", { email, ending_key, metric_name: KLAVIYO_METRIC_NAME });
+    console.log("✅ All good:", { email, ending_key });
     return res.status(200).json({ ok: true });
   } catch (err) {
     console.error("💥 Handler error:", err);
