@@ -1,5 +1,5 @@
 // /api/typeform-quiz.js
-// Fager Quiz → Klaviyo Events + Subscription (working version)
+// Fager Quiz → Klaviyo Events + Subscription (working version + profile properties)
 
 export default async function handler(req, res) {
   if (req.method !== "POST") return res.status(405).json({ error: "Method not allowed" });
@@ -131,6 +131,44 @@ export default async function handler(req, res) {
       return res.status(200).json({ ok: false, step: "profile_id_missing" });
     }
     console.log("👤 Profile ID:", profileId);
+
+    // --- (1b) UPDATE PROFILE PROPERTIES (quiz fields) ---
+    try {
+      const profileUpdateBody = {
+        data: {
+          type: "profile",
+          id: profileId,
+          attributes: {
+            properties: {
+              quiz_name,
+              ending_title: endingTitle,
+              ending_key,
+              source
+            }
+          }
+        }
+      };
+
+      const updateResp = await fetch(`https://a.klaviyo.com/api/profiles/${profileId}/`, {
+        method: "PATCH",
+        headers: {
+          "Content-Type": "application/json",
+          Accept: "application/json",
+          Authorization: `Klaviyo-API-Key ${KLAVIYO_API_KEY}`,
+          revision: "2024-07-15"
+        },
+        body: JSON.stringify(profileUpdateBody)
+      });
+
+      const updTxt = await updateResp.text().catch(() => "");
+      if (!updateResp.ok) {
+        console.error("❌ Profile properties PATCH error:", updateResp.status, updTxt.slice(0, 400));
+      } else {
+        console.log("📝 Profile properties set:", { quiz_name, endingTitle, ending_key, source });
+      }
+    } catch (e) {
+      console.error("❌ Profile properties PATCH failed:", e?.message || e);
+    }
 
     // --- (2) SUBSCRIBE (email-only) via bulk-job (no consented_at/method) ---
     const subscribeBody = {
