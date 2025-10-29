@@ -1,16 +1,20 @@
 // /api/typeform-quiz.js
 // Fager Quiz → Klaviyo: Profile props + Subscription + Event
-// Extra robust ending-detection: outcome.title OR redirect URL Label OR hidden.ending
+// Auto-derive group & path from redirect hints (e.g. "quiz-snaffle-36") in URL Label or Hidden variables.
+// Priority order:
+// 1) Hidden overrides: quiz_path, quiz_group, ending
+// 2) Outcome/Ending label: parse "quiz-(young|snaffle|leverage)-<n>" or "global/(product|knowledge-base)/..."
+// 3) Fallbacks
 
 export default async function handler(req, res) {
   if (req.method !== "POST") return res.status(405).json({ error: "Method not allowed" });
   console.log("▶️ Using Serverless Subscribe+Poll v2 (email-only)");
 
   // === Env ===
-  const KLAVIYO_API_KEY   = process.env.KLAVIYO_API_KEY;
-  const KLAVIYO_LIST_ID   = process.env.KLAVIYO_LIST_ID;
-  const KLAVIYO_METRIC    = process.env.KLAVIYO_METRIC_NAME || "Fager Quiz Completed";
-  const TYPEFORM_SECRET   = process.env.TYPEFORM_SECRET || "";
+  const KLAVIYO_API_KEY = process.env.KLAVIYO_API_KEY;
+  const KLAVIYO_LIST_ID = process.env.KLAVIYO_LIST_ID;
+  const KLAVIYO_METRIC  = process.env.KLAVIYO_METRIC_NAME || "Fager Quiz Completed";
+  const TYPEFORM_SECRET = process.env.TYPEFORM_SECRET || "";
 
   if (!KLAVIYO_API_KEY || !KLAVIYO_LIST_ID) {
     console.error("❌ Missing env vars (KLAVIYO_API_KEY or KLAVIYO_LIST_ID)");
@@ -25,9 +29,9 @@ export default async function handler(req, res) {
         "Content-Type": "application/json",
         Accept: "application/json",
         Authorization: `Klaviyo-API-Key ${KLAVIYO_API_KEY}`,
-        revision: "2024-07-15"
+        revision: "2024-07-15",
       },
-      body: JSON.stringify(body)
+      body: JSON.stringify(body),
     });
 
   const kget = (url) =>
@@ -36,8 +40,8 @@ export default async function handler(req, res) {
       headers: {
         Accept: "application/json",
         Authorization: `Klaviyo-API-Key ${KLAVIYO_API_KEY}`,
-        revision: "2024-07-15"
-      }
+        revision: "2024-07-15",
+      },
     });
 
   const slugify = (s) =>
@@ -48,7 +52,7 @@ export default async function handler(req, res) {
       .trim()
       .replace(/[^a-z0-9]+/g, "_")
       .replace(/^_+|_+$/g, "")
-      .slice(0, 60) || "unknown";
+      .slice(0, 120) || "unknown";
 
   const pollJob = async (url, timeoutMs = 45000, intervalMs = 3000) => {
     const started = Date.now();
@@ -62,14 +66,8 @@ export default async function handler(req, res) {
         json?.data?.attributes?.job_status ||
         "unknown";
       console.log(`🔄 Subscribe job status: ${state}`);
-      if (state === "succeeded" || state === "completed" || state === "complete") {
-        console.log("🎉 Subscribe job completed");
-        return true;
-      }
-      if (state === "failed" || state === "error") {
-        console.error("❌ Subscribe job failed:", t.slice(0, 800));
-        return false;
-      }
+      if (state === "succeeded" || state === "completed" || state === "complete") return true;
+      if (state === "failed" || state === "error") { console.error("❌ Subscribe job failed:", t.slice(0, 800)); return false; }
       await new Promise((r) => setTimeout(r, intervalMs));
     }
     console.log("ℹ️ Subscribe accepted but no terminal job status in time (continuing).");
@@ -80,7 +78,7 @@ export default async function handler(req, res) {
     const body = typeof req.body === "string" ? JSON.parse(req.body) : req.body;
     const fr = body?.form_response || {};
 
-    // Optional shared secret from Typeform
+    // Optional: ignore Typeform "Send test request"
     const isTypeformTest =
       fr?.hidden?.quiz_name === "hidden_value" ||
       fr?.hidden?.ending    === "hidden_value" ||
@@ -93,13 +91,12 @@ export default async function handler(req, res) {
         return res.status(200).json({ ok: true, note: "Secret mismatch" });
       }
     }
-
     if (isTypeformTest) {
       console.log("🧪 Typeform test payload – skipping Klaviyo");
-      return res.status(200).json({ ok: true, note: "Typeform test – skipped" });
+      return res.status(200).json({ ok: true, note: "Typeform test – skipped Klaviyo" });
     }
 
-    // Email extraction
+    // --- Email
     const email =
       (fr.answers || []).find((a) => a?.type === "email" && a?.email)?.email ||
       fr.hidden?.email ||
@@ -107,30 +104,85 @@ export default async function handler(req, res) {
 
     if (!email) {
       console.warn("⚠️ No email in submission; skipping Klaviyo send.");
-      return res.status(200).json({ ok: true, note: "No email; skipping" });
+      return res.status(200).json({ ok: true, note: "No email; skipping." });
     }
 
-    // ---------- Ending detection (robust) ----------
-    // Primary: outcome.title (true Outcomes / Match mode)
-    // Fallback 1: Redirect URL Label (we map to calculated.outcome.title in some TF payloads)
-    // Fallback 2: hidden.ending
-    const outcomeTitle =
-      fr?.calculated?.outcome?.title ||
+    // ---------- Extract titles/labels ----------
+    const labelLike =
       fr?.ending?.title ||
       fr?.ending?.label ||
-      fr?.definition?.endings?.[0]?.title ||  // some payload shapes
-      body?.form?.endings?.[0]?.title ||       // very defensive
-      null;
+      fr?.calculated?.outcome?.title || // may hold label text if Outcome was used
+      "";
 
-    const endingTitle = outcomeTitle || fr?.hidden?.ending || "Unknown";
-    const ending_key  = slugify(endingTitle);
+    const hidden = fr?.hidden || {};
 
-    const quiz_name   = fr?.hidden?.quiz_name || "FagerBitQuiz";
-    const source      = fr?.hidden?.source || "Website";
+    // Primary ending title
+    const endingTitle =
+      fr?.calculated?.outcome?.title ||
+      hidden?.ending ||
+      labelLike || // if label contains the name
+      "Unknown";
+
+    const ending_key = slugify(endingTitle);
+
+    // Other simple fields
+    const quiz_name   = hidden?.quiz_name || "FagerBitQuiz";
+    const source      = hidden?.source || "Website";
     const submittedAt = fr?.submitted_at || new Date().toISOString();
 
+    // ---------- Derive quiz_group & quiz_path ----------
+    // Highest priority: hidden overrides
+    let quiz_path  = hidden?.quiz_path || null;
+    let quiz_group = (hidden?.quiz_group || "").toLowerCase().trim() || null;
+
+    // If not provided, try to parse redirect hints from label-like text
+    //   e.g. "quiz-snaffle-36", "quiz-young-2", "quiz-leverage-13"
+    //   or full "global/product/..." or "global/knowledge-base/..."
+    const lowerLabel = String(labelLike || "").toLowerCase();
+
+    // Regex helpers
+    const reCategory = /(quiz-(young|snaffle|leverage)-\d+)/i;
+    const reProduct  = /(global\/product\/[a-z0-9\-]+(\?[^\s]+)*)/i;
+    const reKB       = /(global\/knowledge-base\/[a-z0-9\-]+(\?[^\s]+)*)/i;
+
+    if (!quiz_path) {
+      // Product / KB direct paths (if label carries full path)
+      const mProd = lowerLabel.match(reProduct);
+      const mKB   = lowerLabel.match(reKB);
+      if (mProd?.[1]) {
+        quiz_path = mProd[1]; // already relative path like "global/product/...."
+        quiz_group = "product";
+      } else if (mKB?.[1]) {
+        quiz_path = mKB[1];
+        quiz_group = "kb";
+      }
+    }
+
+    if (!quiz_path) {
+      // Category paths
+      const mCat = lowerLabel.match(reCategory);
+      if (mCat?.[1]) {
+        quiz_path = `global/category/${mCat[1].toLowerCase()}`; // preserve digit suffix
+        quiz_group = mCat[2].toLowerCase(); // young | snaffle | leverage
+      }
+    }
+
+    // Final fallbacks if still missing
+    if (!quiz_group && quiz_path) {
+      if (quiz_path.includes("quiz-young-")) quiz_group = "young";
+      else if (quiz_path.includes("quiz-snaffle-")) quiz_group = "snaffle";
+      else if (quiz_path.includes("quiz-leverage-")) quiz_group = "leverage";
+      else if (quiz_path.includes("global/product/")) quiz_group = "product";
+      else if (quiz_path.includes("global/knowledge-base/")) quiz_group = "kb";
+    }
+
+    if (!quiz_path) {
+      // Safe default if nothing parsed; you can change this if desired
+      quiz_path = "global/category/quiz-young-2";
+    }
+
     console.log("🧩 Ending detected:", endingTitle, "→", ending_key);
-    // console.log("DEBUG TF fields:", { outcome: fr?.calculated?.outcome?.title, hidden: fr?.hidden });
+    console.log("🌐 Derived group/path:", quiz_group || "(unknown)", "→", quiz_path);
 
     // ---------- (1) PROFILE UPSERT ----------
     const profileBody = { data: { type: "profile", attributes: { email } } };
@@ -150,7 +202,7 @@ export default async function handler(req, res) {
     }
     console.log("👤 Profile ID:", profileId);
 
-    // ---------- (1b) PATCH PROFILE PROPERTIES (quiz fields) ----------
+    // ---------- (1b) PATCH PROFILE PROPERTIES ----------
     try {
       const profileUpdateBody = {
         data: {
@@ -161,7 +213,9 @@ export default async function handler(req, res) {
               quiz_name,
               ending_title: endingTitle,
               ending_key,
-              source
+              source,
+              quiz_group: quiz_group || null,
+              quiz_path
             }
           }
         }
@@ -178,11 +232,8 @@ export default async function handler(req, res) {
         body: JSON.stringify(profileUpdateBody)
       });
       const updTxt = await upd.text().catch(() => "");
-      if (!upd.ok) {
-        console.error("❌ Profile properties PATCH error:", upd.status, updTxt.slice(0, 400));
-      } else {
-        console.log("📝 Profile properties set:", { quiz_name, endingTitle, ending_key, source });
-      }
+      if (!upd.ok) console.error("❌ Profile properties PATCH error:", upd.status, updTxt.slice(0, 400));
+      else console.log("📝 Profile properties set:", { quiz_name, endingTitle, ending_key, source, quiz_group, quiz_path });
     } catch (e) {
       console.error("❌ Profile properties PATCH failed:", e?.message || e);
     }
@@ -198,9 +249,7 @@ export default async function handler(req, res) {
                 type: "profile",
                 attributes: {
                   email,
-                  subscriptions: {
-                    email: { marketing: { consent: "SUBSCRIBED" } }
-                  }
+                  subscriptions: { email: { marketing: { consent: "SUBSCRIBED" } } }
                 }
               }
             ]
@@ -211,12 +260,9 @@ export default async function handler(req, res) {
     };
 
     console.log("✅ Subscribing (email-only) with consent + list (creating job)...");
-    const subResp   = await kpost("https://a.klaviyo.com/api/profile-subscription-bulk-create-jobs/", subscribeBody);
-    const subStatus = subResp.status;
-    const subHdrs   = Object.fromEntries(subResp.headers.entries());
-    const jobUrl    = subHdrs["content-location"] || subHdrs["location"] || null;
-    const subTxt    = await subResp.text().catch(() => "");
-    console.log("Subscribe status:", subStatus);
+    const subResp = await kpost("https://a.klaviyo.com/api/profile-subscription-bulk-create-jobs/", subscribeBody);
+    const subHdrs = Object.fromEntries(subResp.headers.entries());
+    const jobUrl  = subHdrs["content-location"] || subHdrs["location"] || null;
     if (jobUrl) await pollJob(jobUrl);
     else console.log("ℹ️ Subscribe accepted (no job URL header); proceeding.");
 
@@ -230,6 +276,8 @@ export default async function handler(req, res) {
             ending_key,
             ending_title: endingTitle,
             source,
+            quiz_group: quiz_group || null,
+            quiz_path,
             submitted_at: submittedAt,
             typeform_form_id: fr?.form_id,
             typeform_response_id: fr?.token
@@ -248,7 +296,7 @@ export default async function handler(req, res) {
       return res.status(200).json({ ok: false, step: "event", status: eventResp.status });
     }
 
-    console.log("✅ All good:", { email, ending_key });
+    console.log("✅ All good:", { email, ending_key, quiz_path });
     return res.status(200).json({ ok: true });
   } catch (err) {
     console.error("💥 Handler error:", err);
