@@ -5,7 +5,8 @@
 // - Do NOT overwrite properties with null (keeps last good values)
 // - Derive ending_key from ending_title when missing
 // - Detect horse_name via ref/hidden/label, fallback to first non-email text
-// - Extract ending + quiz_path from ANY strings, incl. URL Labels ("Name slug-slug") & URLs
+// - Extract ending + quiz_path from ANY strings (URL Labels "Name slug", URLs, quiz-short)
+// - Auto-derive quiz_group from quiz_path (young/snaffle/leverage) on every run
 // - Proper Events API payload: metric/profile use { data: ... }
 
 const KLAVIYO_API_BASE = "https://a.klaviyo.com/api";
@@ -18,6 +19,7 @@ export default async function handler(req, res) {
     const fr   = body?.form_response || {};
     const nowISO = new Date().toISOString();
 
+    // Optional shared secret
     const TYPEFORM_SECRET = process.env.TYPEFORM_SECRET || "";
     if (TYPEFORM_SECRET) {
       const sentSecret = body?.secret || fr?.hidden?.secret;
@@ -27,6 +29,7 @@ export default async function handler(req, res) {
       }
     }
 
+    // Ignore Typeform's built-in test
     const isTypeformTest =
       fr?.hidden?.quiz_name === "hidden_value" ||
       fr?.hidden?.ending === "hidden_value" ||
@@ -36,7 +39,7 @@ export default async function handler(req, res) {
       return res.status(200).json({ ok: true, note: "Typeform test – skipped" });
     }
 
-    // 1) Normalize fields (email, horse, ending/title/key/path if present)
+    // 1) Normalize fields (raw + hidden + answers)
     let {
       email,
       horse_name,
@@ -52,7 +55,7 @@ export default async function handler(req, res) {
       return res.status(200).json({ ok: true, note: "No email" });
     }
 
-    // 2) EXTRA: derive from any strings in payload (URL Labels, URLs, quiz-short)
+    // 2) EXTRA: deep extract from all strings (URL labels, URLs, quiz-short)
     const { foundPath, foundEnding } = extractFromStrings(fr);
     if (!ending_title && foundEnding) ending_title = foundEnding;
     if (!quiz_path && foundPath) quiz_path = foundPath;
@@ -60,7 +63,10 @@ export default async function handler(req, res) {
     // derive ending_key from title when missing
     const ending_key = ending_key_raw || (ending_title ? safeSlug(ending_title) : null);
 
-    // 3) Resolve profile id (create or fetch; tolerate 409)
+    // derive current quiz_group from path
+    const quiz_group_current = deriveQuizGroup(quiz_path);
+
+    // 3) Resolve profile id
     const profileId = await getOrCreateProfileId(email);
     if (!profileId) {
       console.error("❌ Could not resolve profile ID");
@@ -77,6 +83,7 @@ export default async function handler(req, res) {
       ending: ending_title || null,
       ending_key: ending_key || null,
       quiz_path: quiz_path || null,
+      quiz_group: quiz_group_current || null,
       quiz_name: quiz_name || "Fager Quiz",
       source: source || "typeform",
       typeform_form_id: fr?.form_id || null,
@@ -86,11 +93,18 @@ export default async function handler(req, res) {
     const prevHistory = Array.isArray(existingProps.quiz_history) ? existingProps.quiz_history : [];
     const history = [newEntry, ...prevHistory].slice(0, 100);
 
-    // 6) “Last good value” fallback so we never blank out ending/path
+    // 6) “Last good value” fallbacks so we never blank out fields
     const latestWithEnding = history.find(e => e?.ending || e?.ending_key || e?.quiz_path) || {};
+
     const ending_title_final = ending_title ?? latestWithEnding.ending ?? existingProps.ending_title ?? null;
     const ending_key_final   = ending_key   ?? latestWithEnding.ending_key ?? existingProps.ending_key ?? null;
     const quiz_path_final    = quiz_path    ?? latestWithEnding.quiz_path  ?? existingProps.quiz_path  ?? null;
+    const quiz_group_final =
+      quiz_group_current
+      ?? deriveQuizGroup(latestWithEnding.quiz_path)
+      ?? deriveQuizGroup(existingProps.quiz_path)
+      ?? existingProps.quiz_group
+      ?? null;
     const quiz_name_final    = quiz_name    ?? existingProps.quiz_name ?? "Fager Quiz";
     const source_final       = source       ?? existingProps.source    ?? "typeform";
     const horse_name_final   = horse_name   ?? existingProps.horse_name ?? null;
@@ -100,14 +114,15 @@ export default async function handler(req, res) {
       ...(horse_name_final    ? { horse_name: horse_name_final } : {}),
       ...(ending_title_final  ? { ending_title: ending_title_final } : {}),
       ...(ending_key_final    ? { ending_key: ending_key_final } : {}),
-      ...(quiz_path_final     ? { quiz_path: quiz_path_final } : {}),
-      ...(quiz_name_final     ? { quiz_name: quiz_name_final } : {}),
-      ...(source_final        ? { source: source_final } : {}),
+      ...(quiz_path_final     ? { quiz_path:  quiz_path_final } : {}),
+      ...(quiz_group_final    ? { quiz_group: quiz_group_final } : {}),
+      ...(quiz_name_final     ? { quiz_name:  quiz_name_final } : {}),
+      ...(source_final        ? { source:     source_final } : {}),
       quiz_history: history
     };
     await patchProfileProperties(profileId, propertiesPatch);
 
-    // 8) Subscribe (email marketing consent) to list if provided
+    // 8) Subscribe to list (optional)
     if (process.env.KLAVIYO_LIST_ID) {
       await subscribeProfileToList(email, process.env.KLAVIYO_LIST_ID);
     }
@@ -119,8 +134,9 @@ export default async function handler(req, res) {
       properties: {
         ...(quiz_name_final    ? { quiz_name:  quiz_name_final } : {}),
         ...(ending_title_final ? { ending_title: ending_title_final } : {}),
-        ...(ending_key_final   ? { ending_key: ending_key_final } : {}),
+        ...(ending_key_final   ? { ending_key:  ending_key_final } : {}),
         ...(quiz_path_final    ? { quiz_path:  quiz_path_final } : {}),
+        ...(quiz_group_final   ? { quiz_group: quiz_group_final } : {}),
         ...(horse_name_final   ? { horse_name: horse_name_final } : {}),
         ...(source_final       ? { source:     source_final } : {}),
         submitted_at: fr?.submitted_at || nowISO,
@@ -132,6 +148,7 @@ export default async function handler(req, res) {
       email,
       ending_key: ending_key_final || "(none)",
       quiz_path:  quiz_path_final || "(none)",
+      quiz_group: quiz_group_final || "(none)",
       horse_name: horse_name_final || "(none)"
     });
 
@@ -164,6 +181,12 @@ function safeSlug(s) {
     .toLowerCase().trim()
     .replace(/[^a-z0-9]+/g, "_").replace(/^_+|_+$/g, "")
     .slice(0, 60) || "unknown";
+}
+
+function deriveQuizGroup(path) {
+  if (!path) return null;
+  const m = String(path).match(/quiz-(young|snaffle|leverage)/i);
+  return m ? m[1].toLowerCase() : null;
 }
 
 async function getProfileProperties(profileId) {
@@ -255,6 +278,7 @@ function normalizeTypeformPayload(payload) {
   };
   const byType = (t) => extractAnswerValue(answers.find(x => x?.type === t));
 
+  // First free-text answer that isn't the email answer (fallback)
   const firstNonEmailText = () => {
     const a = answers.find(x => x?.type === "text" && !x?.email);
     return extractAnswerValue(a);
