@@ -174,6 +174,25 @@ async function getProfileProperties(profileId) {
   }
 }
 
+async function patchProfileProperties(profileId, properties) {
+  try {
+    const body = {
+      data: {
+        type: "profile",
+        id: profileId,
+        attributes: { properties }
+      }
+    };
+    const resp = await kpatch(`${KLAVIYO_API_BASE}/profiles/${profileId}/`, body);
+    if (!resp.ok) {
+      const t = await resp.text();
+      console.warn("Profile patch non-OK", resp.status, t);
+    }
+  } catch (e) {
+    console.warn("Profile patch error", e);
+  }
+}
+
 async function subscribeProfileToList(email, listId) {
   try {
     const resp = await kpost(`${KLAVIYO_API_BASE}/profile-subscription-bulk-create-jobs/`, {
