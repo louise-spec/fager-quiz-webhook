@@ -5,6 +5,7 @@
 // - Do NOT overwrite properties with null (keeps last good values)
 // - Derive ending_key from ending_title when missing
 // - Detect horse_name via ref/hidden/label, fallback to first non-email text
+// - Extract ending + quiz_path from ANY strings, incl. URL Labels ("Name slug-slug") & URLs
 // - Proper Events API payload: metric/profile use { data: ... }
 
 const KLAVIYO_API_BASE = "https://a.klaviyo.com/api";
@@ -13,12 +14,10 @@ export default async function handler(req, res) {
   try {
     if (req.method !== "POST") return res.status(405).json({ error: "Method not allowed" });
 
-    // 1) Normalize incoming payload
     const body = typeof req.body === "string" ? JSON.parse(req.body) : req.body;
     const fr   = body?.form_response || {};
     const nowISO = new Date().toISOString();
 
-    // Optional shared secret (to ignore spoofed requests)
     const TYPEFORM_SECRET = process.env.TYPEFORM_SECRET || "";
     if (TYPEFORM_SECRET) {
       const sentSecret = body?.secret || fr?.hidden?.secret;
@@ -28,7 +27,6 @@ export default async function handler(req, res) {
       }
     }
 
-    // Ignore Typeform's built-in test
     const isTypeformTest =
       fr?.hidden?.quiz_name === "hidden_value" ||
       fr?.hidden?.ending === "hidden_value" ||
@@ -38,8 +36,8 @@ export default async function handler(req, res) {
       return res.status(200).json({ ok: true, note: "Typeform test – skipped" });
     }
 
-    // 2) Extract fields
-    const {
+    // 1) Normalize fields (email, horse, ending/title/key/path if present)
+    let {
       email,
       horse_name,
       ending_title,
@@ -53,6 +51,11 @@ export default async function handler(req, res) {
       console.warn("⚠️ No email; skipping Klaviyo");
       return res.status(200).json({ ok: true, note: "No email" });
     }
+
+    // 2) EXTRA: derive from any strings in payload (URL Labels, URLs, quiz-short)
+    const { foundPath, foundEnding } = extractFromStrings(fr);
+    if (!ending_title && foundEnding) ending_title = foundEnding;
+    if (!quiz_path && foundPath) quiz_path = foundPath;
 
     // derive ending_key from title when missing
     const ending_key = ending_key_raw || (ending_title ? safeSlug(ending_title) : null);
@@ -81,7 +84,7 @@ export default async function handler(req, res) {
     };
 
     const prevHistory = Array.isArray(existingProps.quiz_history) ? existingProps.quiz_history : [];
-    const history = [newEntry, ...prevHistory].slice(0, 100); // cap length
+    const history = [newEntry, ...prevHistory].slice(0, 100);
 
     // 6) “Last good value” fallback so we never blank out ending/path
     const latestWithEnding = history.find(e => e?.ending || e?.ending_key || e?.quiz_path) || {};
@@ -176,13 +179,7 @@ async function getProfileProperties(profileId) {
 
 async function patchProfileProperties(profileId, properties) {
   try {
-    const body = {
-      data: {
-        type: "profile",
-        id: profileId,
-        attributes: { properties }
-      }
-    };
+    const body = { data: { type: "profile", id: profileId, attributes: { properties } } };
     const resp = await kpatch(`${KLAVIYO_API_BASE}/profiles/${profileId}/`, body);
     if (!resp.ok) {
       const t = await resp.text();
@@ -258,7 +255,6 @@ function normalizeTypeformPayload(payload) {
   };
   const byType = (t) => extractAnswerValue(answers.find(x => x?.type === t));
 
-  // First free-text answer that isn't the email answer (fallback)
   const firstNonEmailText = () => {
     const a = answers.find(x => x?.type === "text" && !x?.email);
     return extractAnswerValue(a);
@@ -312,10 +308,60 @@ function guessByLabel(answers, keywords) {
   return extractAnswerValue(match);
 }
 
+/* ---------- Deep scan to extract ending/path from any strings ---------- */
+
+function* deepStrings(node) {
+  if (!node) return;
+  if (typeof node === "string") { yield node; return; }
+  if (Array.isArray(node)) { for (const v of node) yield* deepStrings(v); return; }
+  if (typeof node === "object") { for (const k of Object.keys(node)) yield* deepStrings(node[k]); }
+}
+
+// Finds:
+// - full paths: global/(category|product|knowledge-base)/...
+// - URL param: ?ending=Name
+// - label pair: "ReadableName slug-with-dashes" → product path
+// - quiz short: quiz-young-2 → category path
+function extractFromStrings(fr) {
+  let foundPath = null;
+  let foundEnding = null;
+
+  const QUIZ_PATH_RE       = /(global\/(?:category|product|knowledge-base)\/[^\s?"']+)/i;
+  const ENDING_IN_URL_RE   = /[?&]ending=([A-Za-z0-9]+)(?:&|$)/i;
+  const QUIZ_SHORT_RE      = /quiz-(young|snaffle|leverage)-\d+/i;
+  const LABEL_PAIR_PRODUCT = /\b([A-Za-zÅÄÖåäö][A-Za-zÅÄÖåäö0-9]+)\s+([a-z0-9-]{3,})\b/;
+
+  for (const s of deepStrings(fr)) {
+    if (!foundPath) {
+      const p = s.match(QUIZ_PATH_RE);
+      if (p) foundPath = p[1].toLowerCase();
+    }
+    if (!foundEnding) {
+      const e = s.match(ENDING_IN_URL_RE);
+      if (e) foundEnding = e[1];
+    }
+    // Label pair for products: "ReadableName slug-with-dashes"
+    if (!foundPath) {
+      const m = s.match(LABEL_PAIR_PRODUCT);
+      if (m && m[2]?.includes("-")) {
+        foundPath = `global/product/${m[2].toLowerCase()}`;
+        if (!foundEnding) foundEnding = m[1];
+      }
+    }
+    // quiz-young-2 → category path
+    if (!foundPath) {
+      const q = s.match(QUIZ_SHORT_RE);
+      if (q) foundPath = `global/category/${q[0].toLowerCase()}`;
+    }
+    if (foundPath && foundEnding) break;
+  }
+
+  return { foundPath, foundEnding };
+}
+
 /* ---------- Profile helpers (create/resolve, tolerate 409) ---------- */
 
 async function getOrCreateProfileId(email) {
-  // Try upsert; if 409, use duplicate_profile_id or email lookup
   try {
     const resp = await kpost(`${KLAVIYO_API_BASE}/profiles/`, {
       data: { type: "profile", attributes: { email } },
