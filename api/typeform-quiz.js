@@ -1,6 +1,7 @@
 // /api/typeform-quiz.js
 // Typeform → Klaviyo: upsert + subscribe + event
 // PLUS: Spara *flera* quiz per person i `properties.quiz_history` (senaste först)
+// + Robust hantering av 409 duplicate_profile (hämtar duplicate_profile_id / lookup via email)
 
 export default async function handler(req, res) {
   if (req.method !== "POST") return res.status(405).json({ error: "Method not allowed" });
@@ -20,16 +21,12 @@ export default async function handler(req, res) {
     "Content-Type": "application/json",
     Accept: "application/json",
     Authorization: `Klaviyo-API-Key ${KLAVIYO_API_KEY}`,
-    revision: "2024-07-15", // behåll samma header-format som i din fungerande kod
+    revision: "2024-07-15",
   };
 
-  const kpost = (url, body) =>
-    fetch(url, { method: "POST", headers: kheaders, body: JSON.stringify(body) });
-
-  const kpatch = (url, body) =>
-    fetch(url, { method: "PATCH", headers: kheaders, body: JSON.stringify(body) });
-
-  const kget = (url) => fetch(url, { headers: kheaders });
+  const kpost  = (url, body) => fetch(url, { method: "POST",  headers: kheaders, body: JSON.stringify(body) });
+  const kpatch = (url, body) => fetch(url, { method: "PATCH", headers: kheaders, body: JSON.stringify(body) });
+  const kget   = (url)       => fetch(url, { headers: kheaders });
 
   const slugify = (s) =>
     String(s || "")
@@ -48,48 +45,34 @@ export default async function handler(req, res) {
     if (typeof node === "object") { for (const k of Object.keys(node)) yield* deepStrings(node[k]); }
   }
 
-  // Plockar ending + path från allt som kan finnas i payloaden
   function extractFromStrings(fr) {
-    let foundPath = null;   // global/category/quiz-snaffle-36  eller product/… / knowledge-base/…
-    let foundEnding = null; // HildaMaria
-    let foundGroup = null;  // young | snaffle | leverage
-
+    let foundPath = null, foundEnding = null, foundGroup = null;
     const QUIZ_PATH_RE     = /(global\/(?:category|product|knowledge-base)\/[^\s?"']+)/i;
     const QUIZ_SHORT_RE    = /quiz-(young|snaffle|leverage)-\d+/i;
     const ENDING_IN_URL_RE = /[?&]ending=([A-Za-z0-9]+)(?:&|$)/i;
     const LABEL_PAIR_RE    = /\b([A-Za-zÅÄÖåäö]+[A-Za-zÅÄÖåäö0-9]+)\s+(quiz-(young|snaffle|leverage)-\d+)\b/i;
 
     for (const s of deepStrings(fr)) {
-      const p1 = s.match(QUIZ_PATH_RE);
-      if (p1 && !foundPath) foundPath = p1[1];
-
-      const e = s.match(ENDING_IN_URL_RE);
-      if (e && !foundEnding) foundEnding = e[1];
-
+      const p1 = s.match(QUIZ_PATH_RE);     if (p1 && !foundPath)   foundPath   = p1[1];
+      const e  = s.match(ENDING_IN_URL_RE); if (e  && !foundEnding) foundEnding = e[1];
       const lbl = s.match(LABEL_PAIR_RE);
       if (lbl) {
         if (!foundEnding) foundEnding = lbl[1];
-        const short = lbl[2]; // quiz-snaffle-36
+        const short = lbl[2];
         if (!foundPath) foundPath = `global/category/${short.toLowerCase()}`;
         if (!foundGroup) foundGroup = lbl[3].toLowerCase();
       }
-
       if (!foundPath) {
         const q = s.match(QUIZ_SHORT_RE);
-        if (q) {
-          foundPath = `global/category/${q[0].toLowerCase()}`;
-          if (!foundGroup) foundGroup = q[1].toLowerCase();
-        }
+        if (q) { foundPath = `global/category/${q[0].toLowerCase()}`; if (!foundGroup) foundGroup = q[1].toLowerCase(); }
       }
     }
     return { foundPath, foundEnding, foundGroup };
   }
 
-  // Försök hitta hästnamn via hidden eller svarstitel
   function extractHorseName(fr) {
     const hiddenHorse = fr?.hidden?.horse_name || fr?.hidden?.horse || null;
     if (hiddenHorse) return hiddenHorse;
-
     const answers = fr?.answers || [];
     const lower = (s) => (s || "").toString().toLowerCase();
     const guess = answers.find((a) => {
@@ -97,29 +80,56 @@ export default async function handler(req, res) {
       return ["horse", "häst", "hästens namn", "horse name"].some((k) => title.includes(k));
     });
     if (!guess) return null;
+    return guess?.text || guess?.email || guess?.choice?.label ||
+           (typeof guess?.number === "number" ? String(guess.number) : null) ||
+           guess?.date || null;
+  }
 
-    return (
-      guess?.text ||
-      guess?.email ||
-      guess?.choice?.label ||
-      (typeof guess?.number === "number" ? String(guess.number) : null) ||
-      guess?.date ||
-      null
-    );
+  // ---- Robust profil-upsert som tål 409 ----
+  async function findProfileIdByEmail(email) {
+    try {
+      const filter = encodeURIComponent(`equals(email,"${email}")`);
+      const resp = await kget(`https://a.klaviyo.com/api/profiles/?filter=${filter}`);
+      if (!resp.ok) return null;
+      const j = await resp.json().catch(() => ({}));
+      return j?.data?.[0]?.id || null;
+    } catch { return null; }
+  }
+
+  async function getOrCreateProfileId(email) {
+    try {
+      const resp = await kpost("https://a.klaviyo.com/api/profiles/", {
+        data: { type: "profile", attributes: { email } },
+      });
+      const txt = await resp.text().catch(() => "");
+
+      if (resp.ok) {
+        try { return JSON.parse(txt)?.data?.id || null; } catch { return null; }
+      }
+      if (resp.status === 409) {
+        try {
+          const err = JSON.parse(txt);
+          const dupId = err?.errors?.[0]?.meta?.duplicate_profile_id;
+          if (dupId) return dupId;
+        } catch {}
+        return await findProfileIdByEmail(email);
+      }
+      // 202 eller annat → prova lookup via email
+      return await findProfileIdByEmail(email);
+    } catch {
+      return await findProfileIdByEmail(email);
+    }
   }
 
   try {
-    // ---------- parse ----------
     const body = typeof req.body === "string" ? JSON.parse(req.body) : req.body;
     const fr   = body?.form_response || {};
 
-    // Stoppa Typeforms "Send test request"
     const isTypeformTest =
       fr?.hidden?.quiz_name === "hidden_value" ||
       fr?.hidden?.ending === "hidden_value" ||
       fr?.hidden?.source === "hidden_value";
 
-    // Valfri shared secret
     if (TYPEFORM_SECRET) {
       const sentSecret = body?.secret || fr?.hidden?.secret;
       if (sentSecret && sentSecret !== TYPEFORM_SECRET) {
@@ -133,33 +143,25 @@ export default async function handler(req, res) {
       return res.status(200).json({ ok: true, note: "Typeform test – skipped" });
     }
 
-    // email
     const email =
       (fr.answers || []).find((a) => a?.type === "email" && a?.email)?.email ||
-      fr.hidden?.email ||
-      null;
+      fr.hidden?.email || null;
 
     if (!email) {
       console.warn("⚠️ No email; skipping Klaviyo");
       return res.status(200).json({ ok: true, note: "No email" });
     }
 
-    // Grunddata
     const quiz_name   = fr?.hidden?.quiz_name || "FagerBitQuiz";
     const source      = fr?.hidden?.source || "Website";
     const horse_name  = extractHorseName(fr);
     let endingTitle   = fr?.calculated?.outcome?.title || fr?.hidden?.ending || null;
 
-    // Försök extrahera från strängar (URL + Label)
     const { foundPath, foundEnding, foundGroup } = extractFromStrings(fr);
     if (!endingTitle && foundEnding) endingTitle = foundEnding;
 
     const ending_key  = slugify(endingTitle || "unknown");
-    let   quiz_path   = null;
-    if (foundPath) {
-      // normalisera
-      quiz_path = foundPath.replace(/^global\//i, "global/").toLowerCase();
-    }
+    let quiz_path     = foundPath ? foundPath.replace(/^global\//i, "global/").toLowerCase() : null;
     const quiz_group  = foundGroup || null;
 
     const submittedAt = fr?.submitted_at || new Date().toISOString();
@@ -167,26 +169,16 @@ export default async function handler(req, res) {
     console.log("🧩 Ending detected:", endingTitle || "Unknown", "→", ending_key);
     console.log("🌐 Derived group/path:", quiz_group || "(unknown)", "→", quiz_path || "(none)");
 
-    // ---------- upsert profile ----------
-    console.log("👤 Upserting profile…");
-    const profileResp = await kpost("https://a.klaviyo.com/api/profiles/", {
-      data: { type: "profile", attributes: { email } },
-    });
-    const profileTxt  = await profileResp.text().catch(() => "");
-    if (!profileResp.ok) {
-      console.error("❌ Profile upsert:", profileResp.status, profileTxt.slice(0, 800));
-      return res.status(200).json({ ok: false, step: "profile_upsert", status: profileResp.status });
-    }
-    let profileJson = {};
-    try { profileJson = JSON.parse(profileTxt); } catch {}
-    const profileId = profileJson?.data?.id;
+    // ---------- upsert/hämta profile ID (tål 409) ----------
+    console.log("👤 Upserting / resolving profile…");
+    const profileId = await getOrCreateProfileId(email);
     if (!profileId) {
-      console.error("❌ No profile ID");
+      console.error("❌ Could not resolve profile ID after upsert/lookup");
       return res.status(200).json({ ok: false, step: "profile_id_missing" });
     }
     console.log("👤 Profile ID:", profileId);
 
-    // ---------- hämta existerande properties (för att append:a historik) ----------
+    // ---------- hämta existerande properties (för append) ----------
     let existingProps = {};
     try {
       const getResp = await kget(`https://a.klaviyo.com/api/profiles/${profileId}/`);
@@ -216,11 +208,10 @@ export default async function handler(req, res) {
 
     const history = Array.isArray(existingProps.quiz_history) ? [...existingProps.quiz_history] : [];
     history.unshift(newEntry);
-    const trimmed = history.slice(0, 100); // håll lagom storlek
+    const trimmed = history.slice(0, 100);
 
-    // ---------- set profile properties (custom) ----------
+    // ---------- set profile properties ----------
     const profileProps = {
-      // senaste
       quiz_name,
       source,
       ending_title: endingTitle || "Unknown",
@@ -228,48 +219,30 @@ export default async function handler(req, res) {
       ...(quiz_path ? { quiz_path } : {}),
       ...(quiz_group ? { quiz_group } : {}),
       ...(horse_name ? { horse_name } : {}),
-      // full historik
       quiz_history: trimmed,
     };
 
-    // Patcha profil med properties
     await kpatch(`https://a.klaviyo.com/api/profiles/${profileId}/`, {
-      data: {
-        type: "profile",
-        id: profileId,
-        attributes: { properties: profileProps },
-      },
+      data: { type: "profile", id: profileId, attributes: { properties: profileProps } },
     }).catch(() => {});
 
-    // ---------- subscribe to list (email-only) ----------
+    // ---------- subscribe to list ----------
     console.log("✅ Subscribing (email-only) with consent + list (job) …");
-    const subscribeResp = await kpost(
-      "https://a.klaviyo.com/api/profile-subscription-bulk-create-jobs/",
-      {
-        data: {
-          type: "profile-subscription-bulk-create-job",
-          attributes: {
-            profiles: {
-              data: [
-                {
-                  type: "profile",
-                  attributes: {
-                    email,
-                    subscriptions: { email: { marketing: { consent: "SUBSCRIBED" } } },
-                  },
-                },
-              ],
-            },
+    const subscribeResp = await kpost("https://a.klaviyo.com/api/profile-subscription-bulk-create-jobs/", {
+      data: {
+        type: "profile-subscription-bulk-create-job",
+        attributes: {
+          profiles: {
+            data: [{
+              type: "profile",
+              attributes: { email, subscriptions: { email: { marketing: { consent: "SUBSCRIBED" } } } },
+            }],
           },
-          relationships: { list: { data: { type: "list", id: KLAVIYO_LIST_ID } } },
         },
-      }
-    );
-    console.log(
-      subscribeResp.ok
-        ? "ℹ️ Subscribe accepted."
-        : `ℹ️ Subscribe response: ${subscribeResp.status}`
-    );
+        relationships: { list: { data: { type: "list", id: KLAVIYO_LIST_ID } } },
+      },
+    });
+    console.log(subscribeResp.ok ? "ℹ️ Subscribe accepted." : `ℹ️ Subscribe response: ${subscribeResp.status}`);
 
     // ---------- event ----------
     console.log("📤 Posting Event:", KLAVIYO_METRIC);
