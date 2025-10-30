@@ -8,6 +8,8 @@
 // - Extract ending + quiz_path from ANY strings (URL Labels "Name slug", URLs, quiz-short)
 // - Auto-derive quiz_group from quiz_path (young/snaffle/leverage) on every run
 // - Proper Events API payload: metric/profile use { data: ... }
+// - ✅ Email validation: stops invalid email before touching Klaviyo
+// - ✅ FIX: label-pair slugs that start with "quiz-" -> category path (prevents /product/quiz-… 404)
 
 const KLAVIYO_API_BASE = "https://a.klaviyo.com/api";
 
@@ -29,7 +31,7 @@ export default async function handler(req, res) {
       }
     }
 
-    // Ignore Typeform's built-in test
+    // Ignore Typeform test payload
     const isTypeformTest =
       fr?.hidden?.quiz_name === "hidden_value" ||
       fr?.hidden?.ending === "hidden_value" ||
@@ -50,9 +52,12 @@ export default async function handler(req, res) {
       source
     } = normalizeTypeformPayload(body);
 
-    if (!email) {
-      console.warn("⚠️ No email; skipping Klaviyo");
-      return res.status(200).json({ ok: true, note: "No email" });
+    // ✅ Email normalization + validation (prevents "Email Syntax Error")
+    if (typeof email === "string") email = email.trim();
+    const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+    if (!email || !EMAIL_RE.test(email)) {
+      console.warn("⚠️ Invalid email syntax:", email);
+      return res.status(200).json({ ok: true, note: "Invalid email syntax" });
     }
 
     // 2) EXTRA: deep extract from all strings (URL labels, URLs, quiz-short)
@@ -60,7 +65,7 @@ export default async function handler(req, res) {
     if (!ending_title && foundEnding) ending_title = foundEnding;
     if (!quiz_path && foundPath) quiz_path = foundPath;
 
-    // derive ending_key from title when missing
+    // ending_key from title when missing
     const ending_key = ending_key_raw || (ending_title ? safeSlug(ending_title) : null);
 
     // derive current quiz_group from path
@@ -344,7 +349,7 @@ function* deepStrings(node) {
 // Finds:
 // - full paths: global/(category|product|knowledge-base)/...
 // - URL param: ?ending=Name
-// - label pair: "ReadableName slug-with-dashes" → product path
+// - label pair: "ReadableName slug-with-dashes" → product OR category path
 // - quiz short: quiz-young-2 → category path
 function extractFromStrings(fr) {
   let foundPath = null;
@@ -353,7 +358,7 @@ function extractFromStrings(fr) {
   const QUIZ_PATH_RE       = /(global\/(?:category|product|knowledge-base)\/[^\s?"']+)/i;
   const ENDING_IN_URL_RE   = /[?&]ending=([A-Za-z0-9]+)(?:&|$)/i;
   const QUIZ_SHORT_RE      = /quiz-(young|snaffle|leverage)-\d+/i;
-  const LABEL_PAIR_PRODUCT = /\b([A-Za-zÅÄÖåäö][A-Za-zÅÄÖåäö0-9]+)\s+([a-z0-9-]{3,})\b/;
+  const LABEL_PAIR_PRODUCT_OR_QUIZ = /\b([A-Za-zÅÄÖåäö][A-Za-zÅÄÖåäö0-9]+)\s+([a-z0-9-]{3,})\b/;
 
   for (const s of deepStrings(fr)) {
     if (!foundPath) {
@@ -364,19 +369,28 @@ function extractFromStrings(fr) {
       const e = s.match(ENDING_IN_URL_RE);
       if (e) foundEnding = e[1];
     }
-    // Label pair for products: "ReadableName slug-with-dashes"
+
+    // Label pair: "ReadableName slug-with-dashes"
     if (!foundPath) {
-      const m = s.match(LABEL_PAIR_PRODUCT);
+      const m = s.match(LABEL_PAIR_PRODUCT_OR_QUIZ);
       if (m && m[2]?.includes("-")) {
-        foundPath = `global/product/${m[2].toLowerCase()}`;
+        const slug = m[2].toLowerCase();
+        // ✅ If slug is a quiz short, treat as CATEGORY path
+        if (/^quiz-(young|snaffle|leverage)-\d+$/i.test(slug)) {
+          foundPath = `global/category/${slug}`;
+        } else {
+          foundPath = `global/product/${slug}`;
+        }
         if (!foundEnding) foundEnding = m[1];
       }
     }
-    // quiz-young-2 → category path
+
+    // quiz-young-2 in any string → category path
     if (!foundPath) {
       const q = s.match(QUIZ_SHORT_RE);
       if (q) foundPath = `global/category/${q[0].toLowerCase()}`;
     }
+
     if (foundPath && foundEnding) break;
   }
 
