@@ -5,11 +5,12 @@
 // - Do NOT overwrite properties with null (keeps last good values)
 // - Derive ending_key from ending_title when missing
 // - Detect horse_name via ref/hidden/label, fallback to first non-email text
-// - Extract ending + quiz_path from ANY strings (URL Labels "Name slug", URLs, quiz-short)
+// - Extract ending + quiz_path from ANY strings (URLs, URL Labels "Name slug", quiz-short)
 // - Auto-derive quiz_group from quiz_path (young/snaffle/leverage) on every run
 // - Proper Events API payload: metric/profile use { data: ... }
 // - ✅ Email validation: stops invalid email before touching Klaviyo
-// - ✅ FIX: label-pair slugs that start with "quiz-" -> category path (prevents /product/quiz-… 404)
+// - ✅ Path normalization: always store quiz_path as category|product|knowledge-base WITHOUT "global/"
+// - ✅ Label-pair quiz slugs (quiz-*) → category/quiz-… (prevents /product/quiz-… 404)
 
 const KLAVIYO_API_BASE = "https://a.klaviyo.com/api";
 
@@ -52,6 +53,9 @@ export default async function handler(req, res) {
       source
     } = normalizeTypeformPayload(body);
 
+    // ✅ Normalize any incoming quiz_path from Typeform (URL or path)
+    quiz_path = normalizeQuizPath(quiz_path);
+
     // ✅ Email normalization + validation (prevents "Email Syntax Error")
     if (typeof email === "string") email = email.trim();
     const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
@@ -63,7 +67,7 @@ export default async function handler(req, res) {
     // 2) EXTRA: deep extract from all strings (URL labels, URLs, quiz-short)
     const { foundPath, foundEnding } = extractFromStrings(fr);
     if (!ending_title && foundEnding) ending_title = foundEnding;
-    if (!quiz_path && foundPath) quiz_path = foundPath;
+    if (!quiz_path && foundPath) quiz_path = foundPath; // already normalized
 
     // ending_key from title when missing
     const ending_key = ending_key_raw || (ending_title ? safeSlug(ending_title) : null);
@@ -192,6 +196,32 @@ function deriveQuizGroup(path) {
   if (!path) return null;
   const m = String(path).match(/quiz-(young|snaffle|leverage)/i);
   return m ? m[1].toLowerCase() : null;
+}
+
+// ✅ Normalize quiz_path: strip domain, leading "/", and "global/"; coerce quiz-* → category/quiz-*
+function normalizeQuizPath(p) {
+  if (!p) return null;
+  let s = String(p).toLowerCase().trim();
+
+  // If full URL, extract path part
+  const mUrl = s.match(/https?:\/\/[^/]+\/(.+)$/i);
+  if (mUrl) s = mUrl[1];
+
+  // Remove leading slash
+  s = s.replace(/^\/+/, "");
+
+  // Remove "global/" prefix
+  s = s.replace(/^global\//, "");
+
+  // If it's a quiz-short without prefix, coerce to category/…
+  if (/^quiz-(young|snaffle|leverage)-\d+$/i.test(s)) {
+    s = `category/${s}`;
+  }
+
+  // Keep only valid roots
+  if (!/^(category|product|knowledge-base)\//.test(s)) return null;
+
+  return s;
 }
 
 async function getProfileProperties(profileId) {
@@ -339,6 +369,7 @@ function guessByLabel(answers, keywords) {
 
 /* ---------- Deep scan to extract ending/path from any strings ---------- */
 
+// iterate all strings in an object
 function* deepStrings(node) {
   if (!node) return;
   if (typeof node === "string") { yield node; return; }
@@ -346,49 +377,54 @@ function* deepStrings(node) {
   if (typeof node === "object") { for (const k of Object.keys(node)) yield* deepStrings(node[k]); }
 }
 
-// Finds:
-// - full paths: global/(category|product|knowledge-base)/...
+// Finds (normalized):
+// - full URLs → strip domain & global/, keep category|product|knowledge-base/...
+// - plain paths (with or without global/)
 // - URL param: ?ending=Name
-// - label pair: "ReadableName slug-with-dashes" → product OR category path
-// - quiz short: quiz-young-2 → category path
+// - label pair: "ReadableName slug-with-dashes" → product OR category(quiz-*)
+// - quiz short: quiz-young-2 → category/quiz-young-2
 function extractFromStrings(fr) {
   let foundPath = null;
   let foundEnding = null;
 
-  const QUIZ_PATH_RE       = /(global\/(?:category|product|knowledge-base)\/[^\s?"']+)/i;
-  const ENDING_IN_URL_RE   = /[?&]ending=([A-Za-z0-9]+)(?:&|$)/i;
-  const QUIZ_SHORT_RE      = /quiz-(young|snaffle|leverage)-\d+/i;
-  const LABEL_PAIR_PRODUCT_OR_QUIZ = /\b([A-Za-zÅÄÖåäö][A-Za-zÅÄÖåäö0-9]+)\s+([a-z0-9-]{3,})\b/;
+  const PATH_IN_URL_RE = /https?:\/\/[^\/]+\/((?:global\/)?(?:category|product|knowledge-base)\/[^\s?"']+)/i;
+  const PLAIN_PATH_RE  = /(?:^|[\s"'`])((?:global\/)?(?:category|product|knowledge-base)\/[^\s?"']+)/i;
+  const ENDING_IN_URL_RE = /[?&]ending=([A-Za-z0-9]+)(?:&|$)/i;
+  const LABEL_PAIR_RE = /\b([A-Za-zÅÄÖåäö][A-Za-zÅÄÖåäö0-9]+)\s+([a-z0-9-]{3,})\b/;
+  const QUIZ_SHORT_RE = /quiz-(young|snaffle|leverage)-\d+/i;
 
-  for (const s of deepStrings(fr)) {
+  for (const raw of deepStrings(fr)) {
+    const s = String(raw);
+
     if (!foundPath) {
-      const p = s.match(QUIZ_PATH_RE);
-      if (p) foundPath = p[1].toLowerCase();
+      const u = s.match(PATH_IN_URL_RE);
+      if (u) foundPath = normalizeQuizPath(u[1]);
+    }
+    if (!foundPath) {
+      const p = s.match(PLAIN_PATH_RE);
+      if (p) foundPath = normalizeQuizPath(p[1]);
     }
     if (!foundEnding) {
       const e = s.match(ENDING_IN_URL_RE);
       if (e) foundEnding = e[1];
     }
 
-    // Label pair: "ReadableName slug-with-dashes"
     if (!foundPath) {
-      const m = s.match(LABEL_PAIR_PRODUCT_OR_QUIZ);
+      const m = s.match(LABEL_PAIR_RE);
       if (m && m[2]?.includes("-")) {
         const slug = m[2].toLowerCase();
-        // ✅ If slug is a quiz short, treat as CATEGORY path
-        if (/^quiz-(young|snaffle|leverage)-\d+$/i.test(slug)) {
-          foundPath = `global/category/${slug}`;
+        if (QUIZ_SHORT_RE.test(slug)) {
+          foundPath = normalizeQuizPath(`category/${slug}`);
         } else {
-          foundPath = `global/product/${slug}`;
+          foundPath = normalizeQuizPath(`product/${slug}`);
         }
         if (!foundEnding) foundEnding = m[1];
       }
     }
 
-    // quiz-young-2 in any string → category path
     if (!foundPath) {
       const q = s.match(QUIZ_SHORT_RE);
-      if (q) foundPath = `global/category/${q[0].toLowerCase()}`;
+      if (q) foundPath = normalizeQuizPath(`category/${q[0].toLowerCase()}`);
     }
 
     if (foundPath && foundEnding) break;
