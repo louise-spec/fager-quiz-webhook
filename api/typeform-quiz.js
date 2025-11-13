@@ -11,7 +11,7 @@
 // - ✅ Email validation: stops invalid email before touching Klaviyo
 // - ✅ Path normalization: always store quiz_path as category|product|knowledge-base WITHOUT "global/"
 // - ✅ Label-pair quiz slugs (quiz-*) → category/quiz-… (prevents /product/quiz-… 404)
-// - ✅ Language detection from URLs / hidden → language, newsletter_group, Country
+// - ✅ Language detection → language, newsletter_group, Country
 
 const KLAVIYO_API_BASE = "https://a.klaviyo.com/api";
 
@@ -120,17 +120,14 @@ export default async function handler(req, res) {
     const horse_name_final   = horse_name   ?? existingProps.horse_name ?? null;
 
     // 7) LANGUAGE + COUNTRY + NEWSLETTER GROUP
-    //    - Language drives flows (sv, en, fr, es, de, no, da...)
-    //    - newsletter_group = "se" for sv, otherwise "global"
-    //    - Country (e.g. "Sweden") can be used in older segment definitions
     const language_detected =
       detectLanguageFromFormResponse(fr) ||        // from URLs / hidden
       languageFromEndingKey(ending_key_final) ||   // if you prefix endings later
-      existingProps.language ||                    // keep previous if any
+      languageFromEmail(email) ||                  // NEW: .se/.no/.de/...
+      existingProps.language ||
       null;
 
     const language_final = language_detected || "en";
-
     const newsletter_group_final = language_final === "sv" ? "se" : "global";
 
     const country_from_language = mapLanguageToCountry(language_final);
@@ -270,6 +267,23 @@ function languageFromEndingKey(endingKey) {
   return null;
 }
 
+function languageFromEmail(email) {
+  if (!email) return null;
+  const m = String(email).toLowerCase().match(/@[^.]+\.(\w+)$/);
+  if (!m) return null;
+  const tld = m[1];
+  switch (tld) {
+    case "se": return "sv";
+    case "no": return "no";
+    case "dk":
+    case "da": return "da";
+    case "de": return "de";
+    case "fr": return "fr";
+    case "es": return "es";
+    default:   return null;
+  }
+}
+
 function mapLanguageToCountry(lang) {
   switch ((lang || "").toLowerCase()) {
     case "sv": return "Sweden";
@@ -278,7 +292,6 @@ function mapLanguageToCountry(lang) {
     case "de": return "Germany";
     case "fr": return "France";
     case "es": return "Spain";
-    // engelska och övriga → ingen specifik country (hamnar ändå i Newsletter – Global)
     default:   return null;
   }
 }
@@ -293,12 +306,22 @@ function detectLanguageFromFormResponse(fr) {
     if (["sv", "en", "fr", "es", "de", "no", "da"].includes(v)) return v;
   }
 
-  // 2) Leta efter /sv/ /en/ /fr/ /es/ /de/ /no/ /da/ i alla strängar (t.ex. redirect-URL:er)
-  const LANG_RE = /\/(sv|en|fr|es|de|no|da)(?:\/|$)/i;
+  // 2) Leta efter språk i URLs till fagerbits-domäner
+  const FAGER_HOST_RE = /https?:\/\/([^/]+)\/([^?\s"']+)/i;
   for (const raw of deepStrings(fr)) {
-    const s = typeof raw === "string" ? raw : String(raw);
-    const m = s.match(LANG_RE);
-    if (m) return m[1].toLowerCase();
+    if (typeof raw !== "string") continue;
+    const s = raw;
+
+    const urlMatch = s.match(FAGER_HOST_RE);
+    if (!urlMatch) continue;
+
+    const host = urlMatch[1].toLowerCase();
+    const path = "/" + urlMatch[2];
+
+    if (!/fagerbits\./.test(host) && !/fagerbit\./.test(host)) continue;
+
+    const mLang = path.match(/\/(sv|en|fr|es|de|no|da)(?:\/|$)/i);
+    if (mLang) return mLang[1].toLowerCase();
   }
 
   return null;
