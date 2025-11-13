@@ -11,6 +11,7 @@
 // - ✅ Email validation: stops invalid email before touching Klaviyo
 // - ✅ Path normalization: always store quiz_path as category|product|knowledge-base WITHOUT "global/"
 // - ✅ Label-pair quiz slugs (quiz-*) → category/quiz-… (prevents /product/quiz-… 404)
+// - ✅ Language detection from URLs / hidden → language, newsletter_group, Country
 
 const KLAVIYO_API_BASE = "https://a.klaviyo.com/api";
 
@@ -18,8 +19,8 @@ export default async function handler(req, res) {
   try {
     if (req.method !== "POST") return res.status(405).json({ error: "Method not allowed" });
 
-    const body = typeof req.body === "string" ? JSON.parse(req.body) : req.body;
-    const fr   = body?.form_response || {};
+    const body   = typeof req.body === "string" ? JSON.parse(req.body) : req.body;
+    const fr     = body?.form_response || {};
     const nowISO = new Date().toISOString();
 
     // Optional shared secret
@@ -118,36 +119,63 @@ export default async function handler(req, res) {
     const source_final       = source       ?? existingProps.source    ?? "typeform";
     const horse_name_final   = horse_name   ?? existingProps.horse_name ?? null;
 
-    // 7) Patch profile properties (no null overwrites)
+    // 7) LANGUAGE + COUNTRY + NEWSLETTER GROUP
+    //    - Language drives flows (sv, en, fr, es, de, no, da...)
+    //    - newsletter_group = "se" for sv, otherwise "global"
+    //    - Country (e.g. "Sweden") can be used in older segment definitions
+    const language_detected =
+      detectLanguageFromFormResponse(fr) ||        // from URLs / hidden
+      languageFromEndingKey(ending_key_final) ||   // if you prefix endings later
+      existingProps.language ||                    // keep previous if any
+      null;
+
+    const language_final = language_detected || "en";
+
+    const newsletter_group_final = language_final === "sv" ? "se" : "global";
+
+    const country_from_language = mapLanguageToCountry(language_final);
+    const country_final =
+      country_from_language ||
+      existingProps.Country ||
+      existingProps.country ||
+      null;
+
+    // 8) Patch profile properties (no null overwrites)
     const propertiesPatch = {
-      ...(horse_name_final    ? { horse_name: horse_name_final } : {}),
-      ...(ending_title_final  ? { ending_title: ending_title_final } : {}),
-      ...(ending_key_final    ? { ending_key: ending_key_final } : {}),
-      ...(quiz_path_final     ? { quiz_path:  quiz_path_final } : {}),
-      ...(quiz_group_final    ? { quiz_group: quiz_group_final } : {}),
-      ...(quiz_name_final     ? { quiz_name:  quiz_name_final } : {}),
-      ...(source_final        ? { source:     source_final } : {}),
+      ...(horse_name_final       ? { horse_name: horse_name_final } : {}),
+      ...(ending_title_final     ? { ending_title: ending_title_final } : {}),
+      ...(ending_key_final       ? { ending_key: ending_key_final } : {}),
+      ...(quiz_path_final        ? { quiz_path:  quiz_path_final } : {}),
+      ...(quiz_group_final       ? { quiz_group: quiz_group_final } : {}),
+      ...(quiz_name_final        ? { quiz_name:  quiz_name_final } : {}),
+      ...(source_final           ? { source:     source_final } : {}),
+      ...(language_final         ? { language:   language_final } : {}),
+      ...(newsletter_group_final ? { newsletter_group: newsletter_group_final } : {}),
+      ...(country_final          ? { Country:    country_final } : {}),
       quiz_history: history
     };
     await patchProfileProperties(profileId, propertiesPatch);
 
-    // 8) Subscribe to list (optional)
+    // 9) Subscribe to list (optional)
     if (process.env.KLAVIYO_LIST_ID) {
       await subscribeProfileToList(email, process.env.KLAVIYO_LIST_ID);
     }
 
-    // 9) Post event with correct payload shape
+    // 10) Post event with correct payload shape
     await sendEventToKlaviyo({
       metric_name: process.env.KLAVIYO_METRIC_NAME || "Fager Quiz Completed",
       profile_id: profileId,
       properties: {
-        ...(quiz_name_final    ? { quiz_name:  quiz_name_final } : {}),
-        ...(ending_title_final ? { ending_title: ending_title_final } : {}),
-        ...(ending_key_final   ? { ending_key:  ending_key_final } : {}),
-        ...(quiz_path_final    ? { quiz_path:  quiz_path_final } : {}),
-        ...(quiz_group_final   ? { quiz_group: quiz_group_final } : {}),
-        ...(horse_name_final   ? { horse_name: horse_name_final } : {}),
-        ...(source_final       ? { source:     source_final } : {}),
+        ...(quiz_name_final        ? { quiz_name:  quiz_name_final } : {}),
+        ...(ending_title_final     ? { ending_title: ending_title_final } : {}),
+        ...(ending_key_final       ? { ending_key:  ending_key_final } : {}),
+        ...(quiz_path_final        ? { quiz_path:  quiz_path_final } : {}),
+        ...(quiz_group_final       ? { quiz_group: quiz_group_final } : {}),
+        ...(horse_name_final       ? { horse_name: horse_name_final } : {}),
+        ...(source_final           ? { source:     source_final } : {}),
+        ...(language_final         ? { language:   language_final } : {}),
+        ...(newsletter_group_final ? { newsletter_group: newsletter_group_final } : {}),
+        ...(country_final          ? { Country:    country_final } : {}),
         submitted_at: fr?.submitted_at || nowISO,
       },
       time: fr?.submitted_at || nowISO
@@ -155,10 +183,13 @@ export default async function handler(req, res) {
 
     console.log("✅ All good:", {
       email,
-      ending_key: ending_key_final || "(none)",
-      quiz_path:  quiz_path_final || "(none)",
-      quiz_group: quiz_group_final || "(none)",
-      horse_name: horse_name_final || "(none)"
+      ending_key:       ending_key_final || "(none)",
+      quiz_path:        quiz_path_final || "(none)",
+      quiz_group:       quiz_group_final || "(none)",
+      horse_name:       horse_name_final || "(none)",
+      language:         language_final || "(none)",
+      newsletter_group: newsletter_group_final || "(none)",
+      Country:          country_final || "(none)"
     });
 
     return res.status(200).json({ ok: true, profile_id: profileId, appended: newEntry });
@@ -222,6 +253,55 @@ function normalizeQuizPath(p) {
   if (!/^(category|product|knowledge-base)\//.test(s)) return null;
 
   return s;
+}
+
+/* ---------- Language / country helpers ---------- */
+
+function languageFromEndingKey(endingKey) {
+  if (!endingKey) return null;
+  const s = String(endingKey).toLowerCase();
+  if (s.startsWith("sv_") || s.startsWith("sv-")) return "sv";
+  if (s.startsWith("en_") || s.startsWith("en-")) return "en";
+  if (s.startsWith("fr_") || s.startsWith("fr-")) return "fr";
+  if (s.startsWith("es_") || s.startsWith("es-")) return "es";
+  if (s.startsWith("de_") || s.startsWith("de-")) return "de";
+  if (s.startsWith("no_") || s.startsWith("no-")) return "no";
+  if (s.startsWith("da_") || s.startsWith("da-")) return "da";
+  return null;
+}
+
+function mapLanguageToCountry(lang) {
+  switch ((lang || "").toLowerCase()) {
+    case "sv": return "Sweden";
+    case "no": return "Norway";
+    case "da": return "Denmark";
+    case "de": return "Germany";
+    case "fr": return "France";
+    case "es": return "Spain";
+    // engelska och övriga → ingen specifik country (hamnar ändå i Newsletter – Global)
+    default:   return null;
+  }
+}
+
+function detectLanguageFromFormResponse(fr) {
+  if (!fr) return null;
+
+  // 1) Explicit hidden language if du lägger till det i Typeform (rekommenderat)
+  const hiddenLang = fr?.hidden?.language || fr?.hidden?.lang;
+  if (typeof hiddenLang === "string" && hiddenLang.trim()) {
+    const v = hiddenLang.trim().toLowerCase();
+    if (["sv", "en", "fr", "es", "de", "no", "da"].includes(v)) return v;
+  }
+
+  // 2) Leta efter /sv/ /en/ /fr/ /es/ /de/ /no/ /da/ i alla strängar (t.ex. redirect-URL:er)
+  const LANG_RE = /\/(sv|en|fr|es|de|no|da)(?:\/|$)/i;
+  for (const raw of deepStrings(fr)) {
+    const s = typeof raw === "string" ? raw : String(raw);
+    const m = s.match(LANG_RE);
+    if (m) return m[1].toLowerCase();
+  }
+
+  return null;
 }
 
 async function getProfileProperties(profileId) {
@@ -302,8 +382,8 @@ async function sendEventToKlaviyo({ metric_name, profile_id, properties, time })
 
 function normalizeTypeformPayload(payload) {
   // Priority: direct keys → hidden → answers by ref → guess by label → fallback to first non-email text
-  const direct = (k) => payload?.[k] ?? payload?.[k?.toLowerCase?.()] ?? null;
-  const hidden = payload?.form_response?.hidden || {};
+  const direct  = (k) => payload?.[k] ?? payload?.[k?.toLowerCase?.()] ?? null;
+  const hidden  = payload?.form_response?.hidden || {};
   const answers = payload?.form_response?.answers || [];
 
   const byRef = (ref) => {
@@ -387,11 +467,11 @@ function extractFromStrings(fr) {
   let foundPath = null;
   let foundEnding = null;
 
-  const PATH_IN_URL_RE = /https?:\/\/[^\/]+\/((?:global\/)?(?:category|product|knowledge-base)\/[^\s?"']+)/i;
-  const PLAIN_PATH_RE  = /(?:^|[\s"'`])((?:global\/)?(?:category|product|knowledge-base)\/[^\s?"']+)/i;
+  const PATH_IN_URL_RE   = /https?:\/\/[^\/]+\/((?:global\/)?(?:category|product|knowledge-base)\/[^\s?"']+)/i;
+  const PLAIN_PATH_RE    = /(?:^|[\s"'`])((?:global\/)?(?:category|product|knowledge-base)\/[^\s?"']+)/i;
   const ENDING_IN_URL_RE = /[?&]ending=([A-Za-z0-9]+)(?:&|$)/i;
-  const LABEL_PAIR_RE = /\b([A-Za-zÅÄÖåäö][A-Za-zÅÄÖåäö0-9]+)\s+([a-z0-9-]{3,})\b/;
-  const QUIZ_SHORT_RE = /quiz-(young|snaffle|leverage)-\d+/i;
+  const LABEL_PAIR_RE    = /\b([A-Za-zÅÄÖåäö][A-Za-zÅÄÖåäö0-9]+)\s+([a-z0-9-]{3,})\b/;
+  const QUIZ_SHORT_RE    = /quiz-(young|snaffle|leverage)-\d+/i;
 
   for (const raw of deepStrings(fr)) {
     const s = String(raw);
@@ -446,7 +526,7 @@ async function getOrCreateProfileId(email) {
     }
     if (resp.status === 409) {
       try {
-        const err = JSON.parse(txt);
+        const err   = JSON.parse(txt);
         const dupId = err?.errors?.[0]?.meta?.duplicate_profile_id;
         if (dupId) return dupId;
       } catch {}
@@ -461,7 +541,7 @@ async function getOrCreateProfileId(email) {
 async function findProfileIdByEmail(email) {
   try {
     const filter = encodeURIComponent(`equals(email,"${email}")`);
-    const resp = await kget(`${KLAVIYO_API_BASE}/profiles/?filter=${filter}`);
+    const resp   = await kget(`${KLAVIYO_API_BASE}/profiles/?filter=${filter}`);
     if (!resp.ok) return null;
     const j = await resp.json().catch(() => ({}));
     return j?.data?.[0]?.id || null;
